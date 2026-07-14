@@ -74,7 +74,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x_q,
             w_q,
-            dimension_numbers=(((1, ), (0, )), ((), ())),
+            dimension_numbers=(((x_q.ndim - 1, ), (0, )), ((), ())),
             preferred_element_type=acc_dtype,
         ).astype(jnp.float32)
         out *= x_scale
@@ -82,11 +82,11 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x,
             w_q,
-            dimension_numbers=(((1, ), (0, )), ((), ())),
+            dimension_numbers=(((x.ndim - 1, ), (0, )), ((), ())),
             preferred_element_type=jnp.float32,
         )
-    if not skip_scale:
-        out *= jnp.expand_dims(w_scale, 0)
+    if not skip_scale and w_scale is not None:
+        out *= w_scale.reshape((1,) * (out.ndim - 1) + (-1,))
     return out.astype(x.dtype)
 
 
