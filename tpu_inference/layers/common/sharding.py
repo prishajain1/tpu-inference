@@ -216,6 +216,8 @@ class ShardingConfigManager:
         sequence_parallelism = sharding_strategy.get("sequence_parallelism", 1)
         device_indexes = sharding_strategy.get("device_indexes", None)
 
+        num_kv_heads = 1 if vllm_config.model_config.use_mla else vllm_config.model_config.get_total_num_kv_heads()
+
         decode_context_parallelism = parallel_config.decode_context_parallel_size
 
         if pc_tensor_parallelism != ss_tensor_parallelsim and ss_tensor_parallelsim:
@@ -233,8 +235,6 @@ class ShardingConfigManager:
 
         if enable_dp_attention:
             # Replicate attention layer when num_kv_heads < TP
-            num_kv_heads = 1 if vllm_config.model_config.use_mla else vllm_config.model_config.get_total_num_kv_heads(
-            )
             cache_dtype = vllm_config.cache_config.cache_dtype
             if cache_dtype == 'auto':
                 cache_dtype = vllm_config.model_config.dtype
@@ -305,6 +305,9 @@ class ShardingConfigManager:
         mm_encoder_tp_mode = vllm_config.additional_config.get(
             'mm-encoder-tp-mode', 'weights')
         cls.validate(vllm_config, sharding_strategy)
+
+
+
         return cls(sharding_strategy, device_indexes, mm_encoder_tp_mode)
 
     @classmethod

@@ -639,7 +639,7 @@ class KVCacheManager:
                 if attn_module.attn_type == AttentionType.DECODER:
                     num_kv_heads = common_utils.get_padded_num_heads(
                         attn_module.num_kv_heads,
-                        self.runner.mesh.shape["model"])
+                        model_cnt)
                     head_size = common_utils.get_padded_head_dim(
                         attn_module.head_size)
 

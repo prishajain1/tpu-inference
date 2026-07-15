@@ -165,12 +165,16 @@ class VllmQKVParallelLinear(QKVParallelLinear):
         out, bias = super().forward(x)
         out_jax = jax_view(out)
 
+
+
         out_jax = reorder_concatenated_tensor_for_sharding(
             out_jax,
             self.output_sizes,
             self.tp_size,
             dim=-1,
         )
+
+
         q_jax, k_jax, v_jax = slice_sharded_tensor_for_concatenation(
             out_jax,
             self.output_sizes,
@@ -185,9 +189,13 @@ class VllmQKVParallelLinear(QKVParallelLinear):
         # copies on each replica-group of devices when TP > total_num_kv_heads.
         replicas = self.num_kv_head_replicas
         kv_head_axis = None
-        for a in reversed(mesh.axis_names):
-            if a in ShardingAxisName.ATTN_HEAD and get_mesh_shape_product(
-                    mesh, a) >= replicas:
+        head_spec = ShardingAxisName.ATTN_HEAD
+        if isinstance(head_spec, str):
+            head_axes = (head_spec,)
+        else:
+            head_axes = head_spec
+        for a in reversed(head_axes):
+            if get_mesh_shape_product(mesh, a) >= replicas:
                 kv_head_axis = a
                 break
 

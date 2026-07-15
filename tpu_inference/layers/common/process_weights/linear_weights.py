@@ -104,6 +104,7 @@ def process_linear_weights(
     per_tensor: bool = False,
     enable_kernel: bool = False,
 ) -> LinearWeights:
+    print(f"JETS_DEBUG_WEIGHTS: process_linear_weights called. fused={fused}, output_sizes={output_sizes}, reorder_size={reorder_size}")
     weight = weights.weight
     weight_scale = weights.weight_scale
     zero_point = weights.zero_point
