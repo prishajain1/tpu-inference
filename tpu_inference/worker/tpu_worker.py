@@ -512,6 +512,28 @@ class TPUWorker(WorkerBase):
         total_hbm_limit_cap = total_hbm_limit * gpu_memory_utilization
         total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used)
 
+        # Scale available memory by KV Cache sharding ratio to handle replication in single-process mode
+        if self.devices and len(self.devices) > 1:
+            mesh = self.model_runner.mesh
+            from tpu_inference.layers.common.sharding import ShardingAxisName
+            
+            batch_cnt = utils.get_mesh_shape_product(mesh, ShardingAxisName.BATCH)
+            context_cnt = utils.get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT)
+            head_cnt = utils.get_mesh_shape_product(mesh, ShardingAxisName.KV_CACHE_HEAD)
+            
+            sharding_ratio = batch_cnt * context_cnt * head_cnt
+            num_devices = len(self.devices)
+            
+            if sharding_ratio < num_devices:
+                scaled_hbm_avail = int((total_hbm_avail / num_devices) * sharding_ratio)
+                logger.info(
+                    f"Scaling available HBM for KV Cache: "
+                    f"total_avail={total_hbm_avail/utils.GBYTES:.2f}GB, "
+                    f"num_devices={num_devices}, sharding_ratio={sharding_ratio}, "
+                    f"scaled_avail={scaled_hbm_avail/utils.GBYTES:.2f}GB"
+                )
+                total_hbm_avail = scaled_hbm_avail
+
         total_hbm_limit_gb = round(total_hbm_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(total_hbm_limit_cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(total_hbm_used / utils.GBYTES, 2)
@@ -621,6 +643,7 @@ class TPUWorker(WorkerBase):
     def profile(self,
                 is_start: bool = True,
                 profile_prefix: str | None = None):
+        logger.info(f"JETS_DEBUG_PROF: profile called with is_start={is_start}, profile_dir={self.profile_dir}, profile_prefix={profile_prefix}")
         if is_start:
             standard_opts, advanced_opts = _parse_profile_options(
                 profile_prefix)
