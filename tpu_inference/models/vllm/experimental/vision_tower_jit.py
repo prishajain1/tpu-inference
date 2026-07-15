@@ -26,6 +26,8 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import \
 from vllm.config import VllmConfig
 from vllm.model_executor.models.qwen3_omni_moe_thinker import \
     Qwen3OmniMoeThinkerForConditionalGeneration
+from vllm.model_executor.models.qwen3_vl_moe import \
+    Qwen3VLMoeForConditionalGeneration
 
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import to_jax_dtype
@@ -35,6 +37,7 @@ logger = init_logger(__name__)
 # Architectures whose embed_multimodal function is safe to wrap with jax.jit.
 JITTABLE_ARCHS = {
     Qwen3OmniMoeThinkerForConditionalGeneration,
+    Qwen3VLMoeForConditionalGeneration,
 }
 
 
