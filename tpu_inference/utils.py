@@ -400,10 +400,12 @@ def time_function(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
+        print(f"JETS_TIME_DEBUG: Entering {func.__name__}", flush=True)
         start_time = time.perf_counter()
         result = func(*args, **kwargs)
         end_time = time.perf_counter()
         execution_time = end_time - start_time
+        print(f"JETS_TIME_DEBUG: Function '{func.__name__}' executed in {execution_time:.4f} seconds.", flush=True)
         logger.debug(
             f"Function '{func.__name__}' executed in {execution_time:.4f} seconds."
         )

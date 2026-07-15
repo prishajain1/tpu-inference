@@ -585,6 +585,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.execute_model_state: ExecuteModelState | None = None
         self._continue_decode_output = None
         self.batch_counter = 0
+        self.decode_run_counter = 0
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
@@ -1426,6 +1427,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self,
         scheduler_output: "VllmSchedulerOutput",
     ) -> ModelRunnerOutput:
+        import time
+        t_start = time.perf_counter()
+
+        self.decode_run_counter += 1
+        self.is_profiling_this_run = (self.decode_run_counter == 3 and self.rank == 0)
+        if self.is_profiling_this_run:
+            import os
+            profile_dir = os.path.join(self.vllm_config.profiler_config.torch_profiler_dir, "decode_only")
+            os.makedirs(profile_dir, exist_ok=True)
+            print(f"JETS_DEBUG_PROF: Starting decode-only profile at {profile_dir}", flush=True)
+            jax.profiler.start_trace(profile_dir)
         (
             input_ids,
             input_positions,
@@ -1439,6 +1451,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             _,
             tokens_indices_selector,
         ) = self._prepare_inputs(scheduler_output)
+        t_prep = time.perf_counter()
+        print(f"JETS_TIME_DEBUG: _prepare_inputs took {t_prep - t_start:.4f} seconds", flush=True)
 
         init_tokens = input_ids
         # Map active rows correctly across DP buckets by checking valid query locations.
@@ -1465,6 +1479,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         max_decode_steps_arr = jnp.array(max_decode_steps, dtype=jnp.int32)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
+        t_setup = time.perf_counter()
+        print(f"JETS_TIME_DEBUG: setup state took {t_setup - t_prep:.4f} seconds", flush=True)
 
         # Run continue-decode as a single JIT'd on-device loop (JAX while_loop with
         # donated KV cache) to avoid host syncs. EOS early-exit happens on-device.
@@ -1507,8 +1523,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  logprobs_mode=self.model_config.logprobs_mode,
              )
         self.rng_params_for_sampling = final_rng
-
         self.kv_caches = final_kv_caches
+        t_decode_call = time.perf_counter()
+        print(f"JETS_TIME_DEBUG: continue_decode call took {t_decode_call - t_setup:.4f} seconds", flush=True)
 
         # continue_decode now returns fixed-size stacked buffers plus the
         # number of steps actually executed (early EOS exit can stop before
@@ -1536,6 +1553,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             lp_token_ids_cpu = None
             lp_vals_cpu = None
             lp_ranks_cpu = None
+
+        t_device_get = time.perf_counter()
+        print(f"JETS_TIME_DEBUG: jax.device_get took {t_device_get - t_decode_call:.4f} seconds", flush=True)
 
         actual_steps = int(actual_steps)
         generated_tokens_cpu = np.asarray(generated_tokens_cpu)[:actual_steps]
@@ -1700,7 +1720,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if routed_experts is not None:
             output.routed_experts = routed_experts
 
+        t_post = time.perf_counter()
+        print(f"JETS_TIME_DEBUG: post-processing took {t_post - t_device_get:.4f} seconds", flush=True)
+
         self._continue_decode_output = output
+        t_end = time.perf_counter()
+        print(f"JETS_TIME_DEBUG: rest of _execute_continue_decode took {t_end - t_post:.4f} seconds", flush=True)
+        print(f"JETS_TIME_DEBUG: Total _execute_continue_decode took {t_end - t_start:.4f} seconds", flush=True)
+
+        if hasattr(self, 'is_profiling_this_run') and self.is_profiling_this_run:
+            print("JETS_DEBUG_PROF: Stopping decode-only profile", flush=True)
+            jax.profiler.stop_trace()
+
         return None
 
     def _sample_from_logits(
