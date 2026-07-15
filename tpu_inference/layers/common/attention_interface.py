@@ -452,6 +452,18 @@ def sharded_ragged_paged_attention(
         if not use_hd64:
             kwargs["update_kv_cache"] = update_kv_cache
             kwargs["use_causal_mask"] = use_causal_mask
+            
+            import os
+            d_sizes = os.environ.get("RPA_DECODE_BLOCK_SIZES")
+            if d_sizes:
+                kwargs["d_block_sizes"] = tuple(map(int, d_sizes.split(",")))
+            p_sizes = os.environ.get("RPA_PREFILL_BLOCK_SIZES")
+            if p_sizes:
+                kwargs["p_block_sizes"] = tuple(map(int, p_sizes.split(",")))
+            m_sizes = os.environ.get("RPA_MIXED_BLOCK_SIZES")
+            if m_sizes:
+                kwargs["m_block_sizes"] = tuple(map(int, m_sizes.split(",")))
+                
         return func(*args, **kwargs)
 
     return jax.shard_map(
