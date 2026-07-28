@@ -30,6 +30,7 @@ from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.utils import cpu_mesh_context
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import (JaxEinsum, JaxLinear, JaxLmHead,
@@ -38,6 +39,7 @@ from tpu_inference.layers.jax.linear import (JaxEinsum, JaxLinear, JaxLmHead,
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
+from tpu_inference.layers.jax.quantization.unquantized import UnquantizedConfig
 from tpu_inference.layers.jax.rope_interface import (apply_rope,
                                                      normalize_rope_scaling)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -47,11 +49,36 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
     JaxAutoWeightsLoader, LoadableWithIterator, StandardWeightLoader,
+    assign_and_shard_param, jax_array_from_reshaped_torch,
     load_nnx_param_from_reshaped_torch)
 
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _load_explicit_gate_up_weight(param: nnx.Param,
+                                  torch_tensor,
+                                  shard_id: int = -1,
+                                  *,
+                                  param_name: str) -> None:
+    """Loads gate/up checkpoint tensors into a [D, 2, F] parameter."""
+    shards = param.get_metadata("_gate_up_shards")
+    if shard_id == -1:
+        gate, up = torch_tensor.chunk(2, dim=0)
+        shards[:] = [gate, up]
+    else:
+        shards[shard_id] = torch_tensor
+        if any(shard is None for shard in shards):
+            return
+
+    # Keep all host-side assembly on the CPU mesh. Weight loading runs while a
+    # TPU mesh is active, and mixing the per-projection CPU arrays with that
+    # context makes jnp.stack reject the incompatible device sets.
+    with cpu_mesh_context():
+        gate_up = jnp.stack(
+            [jax_array_from_reshaped_torch(shard) for shard in shards], axis=1)
+    assign_and_shard_param(param, gate_up, param_name=param_name)
 
 
 # MLP arch is the same as Gemma3
@@ -72,16 +99,41 @@ class Gemma4MLP(JaxModule):
         # config.intermediate_size. The caller computes this in
         # Gemma4DecoderLayer and passes it in explicitly.
 
-        self.gate_up_proj = JaxMergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".gate_proj",
-        )
+        self._explicit_gate_up_axis = isinstance(quant_config,
+                                                UnquantizedConfig)
+        if self._explicit_gate_up_axis:
+            # Keep gate/up as an explicit projection axis. The intermediate
+            # axis is TP-sharded, so every device owns matching local slices
+            # of both projections without reconstructing them from a flat
+            # interleaved [2 * F] output.
+            self.gate_up_proj = JaxEinsum(
+                einsum_str="TD,DPF->TPF",
+                kernel_shape=(hidden_size, 2, intermediate_size),
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn,
+                                                  (None, None, "model")),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".gate_proj",
+            )
+            self.gate_up_proj.weight.set_metadata("_gate_up_shards",
+                                                  [None, None])
+            self.gate_up_proj.weight.set_metadata(
+                "weight_loader",
+                partial(_load_explicit_gate_up_weight,
+                        param_name=prefix + ".gate_up_proj.weight"))
+        else:
+            # Quantized methods retain their existing packed representation.
+            self.gate_up_proj = JaxMergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                use_bias=False,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".gate_proj",
+            )
         self.down_proj = JaxLinear(
             intermediate_size,
             hidden_size,
@@ -95,8 +147,13 @@ class Gemma4MLP(JaxModule):
         self.act_fn = partial(nnx.gelu, approximate=True)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate_up = self.gate_up_proj(x)
-        gate, up = jnp.split(gate_up, 2, axis=-1)
+        if self._explicit_gate_up_axis:
+            gate_up = self.gate_up_proj(x)
+            gate = gate_up[..., 0, :]
+            up = gate_up[..., 1, :]
+        else:
+            gate_up = self.gate_up_proj(x)
+            gate, up = jnp.split(gate_up, 2, axis=-1)
         gate = self.act_fn(gate)
         fuse = gate * up
         result = self.down_proj(fuse)

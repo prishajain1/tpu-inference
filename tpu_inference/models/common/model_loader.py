@@ -141,13 +141,18 @@ def _get_nnx_model(
     model_config = (vllm_config.speculative_config.draft_model_config
                     if is_draft_model else vllm_config.model_config)
 
-    def create_abstract_model() -> nnx.Module:
+    def create_abstract_model(graph_updates: bool = False) -> nnx.Module:
         """
         Helper class to create an abstract model for `nnx.eval_shape`.
+
+        ``graph_updates`` is consumed by newer Flax NNX versions. Older NNX
+        versions forward it to the function being evaluated, so accept and
+        ignore it here for compatibility with both behaviors.
 
         Returns:
             An abstract model function.
         """
+        del graph_updates
         return model_class(vllm_config, rng, mesh)
 
     @nnx.jit(donate_argnums=(0, ),
