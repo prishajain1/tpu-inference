@@ -108,6 +108,15 @@ class ScatterTest(jtu.JaxTestCase):
                      [jnp.bfloat16],
                      [8],
                  ),
+                 # Gemma 4 on v6e requires extra column partitions and
+                 # feature padding to fit the SparseCore row-lane limit.
+                 itertools.product(
+                     [16384],
+                     [(300, 2358)],
+                     [2816],
+                     [jnp.bfloat16],
+                     [8],
+                 ),
                  itertools.product(
                      [20480],
                      [(300, 2850)],

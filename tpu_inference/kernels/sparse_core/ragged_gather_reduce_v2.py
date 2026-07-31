@@ -628,17 +628,23 @@ def ragged_gather_reduce(
     num_column_partitions = _calculate_num_column_partitions(
         hidden_size, input_size, num_cores, num_lanes, num_simd_lanes)
     num_row_partitions = num_cores // num_column_partitions
-    if num_row_partitions > num_simd_lanes:
-        # Some hidden sizes cannot be divided into enough DMA-efficient
-        # column partitions for the SparseCore topology (for example Gemma 4
-        # hidden_size=2816 on v6e). Use the correctness fallback rather than
-        # constructing an invalid row grid.
-        return _fallback_implementation(x, indices, topk_weights,
-                                        valid_rows_mask, reduce_group_size)
+    while num_row_partitions > num_simd_lanes:
+        # Shift workers from the row grid to the column grid until the row
+        # count fits the SparseCore SIMD topology. The feature dimension is
+        # padded below when it does not divide the enlarged column grid.
+        next_column_partitions = num_column_partitions * 2
+        if num_cores % next_column_partitions != 0:
+            return _fallback_implementation(x, indices, topk_weights,
+                                            valid_rows_mask,
+                                            reduce_group_size)
+        num_column_partitions = next_column_partitions
+        num_row_partitions = num_cores // num_column_partitions
     num_row_subchunks, row_chunk_size = _calculate_row_tiling(
         input_size, num_simd_lanes, num_row_partitions)
 
     aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
+    if aligned_hidden_size != hidden_size:
+        x = jnp.pad(x, ((0, 0), (0, aligned_hidden_size - hidden_size)))
     col_size = aligned_hidden_size // num_column_partitions
     col_chunk_size = _calculate_col_chunk_size(col_size, num_simd_lanes)
 
