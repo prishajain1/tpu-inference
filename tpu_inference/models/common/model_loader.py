@@ -377,7 +377,7 @@ def get_flax_model(
     # costs ~17 ms/step on Gemma-4-31B decode at TP=2.
     _state_treedef = jax.tree_util.tree_structure(state)
 
-    @jax.jit(
+    run_model_jit_kwargs = dict(
         out_shardings=(
             kv_cache_sharding,
             hidden_states_sharding,
@@ -388,12 +388,22 @@ def get_flax_model(
         static_argnums=(
             6, 9, 10
         ),  # 6 is layer_name_to_kvcache_index, 9 is is_first_rank, 10 is is_last_rank
-        compiler_options=get_step_fn_compiler_options(),
     )
-    def run_model(state_leaves, *args):
+
+    def run_model_impl(state_leaves, *args):
         state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
         return model(*args)
+
+    # compiler_options are valid only when this function is the top-level jit.
+    # continue_decode calls the model from inside its own top-level jit, so keep
+    # an otherwise-identical variant without compiler_options for that path.
+    run_model_no_options = jax.jit(run_model_impl, **run_model_jit_kwargs)
+    run_model = jax.jit(
+        run_model_impl,
+        **run_model_jit_kwargs,
+        compiler_options=get_step_fn_compiler_options(),
+    )
 
     @jax.jit(
         out_shardings=(
@@ -465,6 +475,8 @@ def get_flax_model(
     # `graphdef` and the state treedef are captured in each closure; the
     # runner passes pre-flattened `state_leaves` as the first positional arg.
     jitted_model_fn = run_draft_model if is_draft_model else run_model
+    jitted_model_fn_no_options = (run_draft_model
+                                  if is_draft_model else run_model_no_options)
 
     model_supports_spec_step = supports_kw(model_class.__call__,
                                            "spec_step_idx")
@@ -474,6 +486,17 @@ def get_flax_model(
             kwargs.pop("spec_step_idx", None)
         kwargs.pop("shared_attention_metadata", None)
         return jitted_model_fn(*args, **kwargs)
+
+    def wrapped_model_fn_no_options(*args, **kwargs):
+        if not model_supports_spec_step:
+            kwargs.pop("spec_step_idx", None)
+        kwargs.pop("shared_attention_metadata", None)
+        return jitted_model_fn_no_options(*args, **kwargs)
+
+    # The runner discovers this alternate entry point only for a nested
+    # continue-decode invocation. Normal model execution keeps using the
+    # compiler-options-enabled wrapped_model_fn above.
+    wrapped_model_fn.step_fn_no_options = wrapped_model_fn_no_options
 
     compute_logits_fn = run_compute_logits
     embed_input_ids_fn = run_embed_input_ids

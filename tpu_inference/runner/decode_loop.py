@@ -22,6 +22,8 @@ from vllm.v1.outputs import LogprobsTensors
 
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
+from tpu_inference.models.common.compiler_options import \
+    get_step_fn_compiler_options
 
 
 @functools.partial(
@@ -117,12 +119,7 @@ def _split_rngs(rng, static_size, dynamic_size):
     donate_argnames=("kv_caches", ),
     # Hoisted here from the model's step_fun: JAX forbids compiler_options on
     # a nested jit, so they must live on this top-level loop jit instead.
-    compiler_options={
-        "xla_tpu_all_gather_collective_matmul_mode": "post_spmd_conservative",
-        "xla_tpu_reduce_scatter_collective_matmul_mode":
-        "post_spmd_conservative",
-        "xla_tpu_use_minor_sharding_for_major_trivial_input": "true"
-    },
+    compiler_options=get_step_fn_compiler_options(),
 )
 def _decode_core(
     *,

@@ -2052,8 +2052,10 @@ class CompilationManager:
                 f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}",
                 continue_decode_wrapper,
                 self.runner.state_leaves,
-                getattr(self.runner.model, "step_fn_no_options",
-                        self.runner.model_fn),
+                getattr(
+                    self.runner.model_fn, "step_fn_no_options",
+                    getattr(self.runner.model, "step_fn_no_options",
+                            self.runner.model_fn)),
                 self.runner.compute_logits_fn,
                 sample,
                 self.runner.mesh,
