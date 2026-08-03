@@ -1153,6 +1153,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Initialize to a constant size, and resize later after kv cache size is
         # known.
         self.device_buffer = common_utils.DeviceBuffer(initial_capacity=1024)
+        # Block tables are usually unchanged across decode steps. Keep their
+        # device arrays separate from the per-step metadata blob so unchanged
+        # tables can be reused without another H2D transfer or allocation.
+        self._block_table_host_cache: dict[int, np.ndarray] = {}
+        self._block_table_device_cache: dict[int, jax.Array] = {}
         # Cache a zero scalar JAX array to avoid eager allocation overhead during continue_decode cycles.
         self.zero_array = jnp.array(0, dtype=jnp.int32)
 
@@ -1294,14 +1299,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                             logits_indices_size + block_tables_size)
         self.device_buffer = common_utils.DeviceBuffer(
             initial_capacity=initial_capacity)
+        self._block_table_host_cache.clear()
+        self._block_table_device_cache.clear()
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_runner(self)
 
     def delete_kv_cache(self) -> None:
+        self._block_table_host_cache.clear()
+        self._block_table_device_cache.clear()
         self.kv_cache_manager.delete_kv_cache()
 
     def reinitialize_kv_cache(self) -> None:
+        self._block_table_host_cache.clear()
+        self._block_table_device_cache.clear()
         self.kv_cache_manager.reinitialize_kv_cache()
 
     def capture_model(self) -> None:
@@ -2943,16 +2954,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                      positions,
                                      sharding=data_parallel_attn_sharding)
 
-        # Collect block tables host arrays loops zone presence zones legality
-        def build_block_table_host(kv_cache_gid: int) -> None:
+        # Build block tables separately from the dynamic metadata blob. During
+        # steady-state decode these tables normally remain unchanged for many
+        # iterations, so reuse the existing device array and avoid repeatedly
+        # allocating and transferring the largest metadata field.
+        if not isinstance(getattr(self, "_block_table_host_cache", None), dict):
+            self._block_table_host_cache = {}
+        if not isinstance(getattr(self, "_block_table_device_cache", None),
+                          dict):
+            self._block_table_device_cache = {}
+        device_block_tables: dict[int, jax.Array] = {}
+
+        def build_block_table(kv_cache_gid: int) -> jax.Array:
 
             block_table_obj = self.input_batch.block_table[kv_cache_gid]
-            block_tables_view = self.device_buffer.get_view(
+            block_tables = np.zeros(
                 (self.max_num_reqs, block_table_obj.max_num_blocks_per_req),
-                key=f"block_tables_gid_{kv_cache_gid}")
-
-            # Zero out the view once for correct padding
-            block_tables_view.fill(0)
+                dtype=np.int32)
 
             cpu_tensor = block_table_obj.get_cpu_tensor()
             for dp_rank in range(dp_size):
@@ -2965,8 +2983,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 np.take(cpu_tensor,
                         req_indices_dp[dp_rank],
                         axis=0,
-                        out=block_tables_view[req_offset:req_offset +
-                                              _num_reqs])
+                        out=block_tables[req_offset:req_offset + _num_reqs])
 
             if pcp_size > 1:
                 # PCP fuses the request's head+tail chunks into one
@@ -2975,16 +2992,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 # writing seq is the tail (seq 1) -- so seq 1 must carry a copy
                 # of the request's block table, not the zero padding, or every
                 # strided KV write lands on page 0.
-                block_tables_view[1] = block_tables_view[0]
+                block_tables[1] = block_tables[0]
+
+            cached_host = self._block_table_host_cache.get(kv_cache_gid)
+            if (cached_host is not None
+                    and np.array_equal(cached_host, block_tables)):
+                return self._block_table_device_cache[kv_cache_gid]
+
+            block_tables_device = device_array(
+                self.mesh,
+                block_tables.reshape(-1),
+                sharding=metadata_attn_sharding)
+            self._block_table_host_cache[kv_cache_gid] = block_tables.copy()
+            self._block_table_device_cache[kv_cache_gid] = \
+                block_tables_device
+            return block_tables_device
 
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
             if not no_kv_cache:
-                build_block_table_host(0)
+                device_block_tables[0] = build_block_table(0)
         else:
             for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups):
-                build_block_table_host(gid)
+                device_block_tables[gid] = build_block_table(gid)
 
         metadata_blob, metadata_layout = self.device_buffer.build()
 
@@ -3065,13 +3096,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
             # Pooling model will not using kv cache
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-            block_tables = metadata.get(
-                "block_tables_gid_0") if not no_kv_cache else None
+            block_tables = device_block_tables.get(0) if not no_kv_cache else None
             attention_metadata = build_attn(block_tables)
             shared_attention_metadata = build_shared_attn()
         else:
             attention_metadata = {
-                name: build_attn(metadata[f"block_tables_gid_{gid}"])
+                name: build_attn(device_block_tables[gid])
                 for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
