@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     TPU_MESH_SORT_BY_COORDS: bool = False
+    SAMPLING_MICROBATCH_SIZE: int = 16
+
 
 
 def env_with_choices(
@@ -456,7 +458,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Currently, it only supports a single host set up.
     "TPU_MESH_SORT_BY_COORDS":
     env_bool("TPU_MESH_SORT_BY_COORDS", default=False),
+    # Microbatch size for sampling block. Set to 0 to disable microbatching.
+    "SAMPLING_MICROBATCH_SIZE":
+    lambda: int(os.getenv("SAMPLING_MICROBATCH_SIZE", "16")),
 }
+
 
 
 def __getattr__(name: str) -> Any:

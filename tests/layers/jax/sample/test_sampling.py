@@ -242,6 +242,40 @@ class TestProcessedLogprobs:
 
         assert np.allclose(raw_logprobs, processed, atol=1e-6)
 
+    def test_sampling_transforms_microbatch_preserves_results(self):
+        """A batch of 32 should match two independent batches of 16."""
+        batch_size = 32
+        logits = jnp.arange(batch_size * 64, dtype=jnp.float32).reshape(
+            batch_size, 64)
+        logits = (logits % 37) / 10.0
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.linspace(0.5, 1.5, batch_size),
+            top_k=jnp.arange(batch_size, dtype=jnp.int32) % 8 + 1,
+            top_p=jnp.linspace(0.6, 0.95, batch_size),
+            do_sampling=True,
+            logprobs=True,
+        )
+
+        _, processed_logits = sample(jax.random.PRNGKey(0),
+                                     self._get_fake_mesh(), logits, metadata)
+
+        chunk_results = []
+        for start in (0, 16):
+            chunk_metadata = TPUSupportedSamplingMetadata(
+                temperature=metadata.temperature[start:start + 16],
+                top_k=metadata.top_k[start:start + 16],
+                top_p=metadata.top_p[start:start + 16],
+                do_sampling=True,
+                logprobs=True,
+            )
+            _, chunk_logits = sample(jax.random.PRNGKey(0),
+                                     self._get_fake_mesh(),
+                                     logits[start:start + 16], chunk_metadata)
+            chunk_results.append(chunk_logits)
+
+        assert np.array_equal(processed_logits,
+                              jnp.concatenate(chunk_results, axis=0))
+
 
 class TestComputePromptLogprobs:
 
