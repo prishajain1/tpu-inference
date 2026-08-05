@@ -15,6 +15,8 @@
 import jax.numpy as jnp
 import numpy as np
 
+from tpu_inference.kernels.sparse_core.dense_gather_reduce import \
+    dense_gather_reduce
 from tpu_inference.layers.common.fused_moe_gmm import _invert_permutation
 
 
@@ -38,3 +40,50 @@ def test_invert_permutation_restores_original_order():
     restored = reordered[_invert_permutation(permutation)]
 
     np.testing.assert_array_equal(restored, original)
+
+
+def test_chunked_dense_gather_reduce_matches_full_batch():
+    """TP MoE chunking must gather only the rows for the current chunk."""
+    rng = np.random.default_rng(1234)
+    num_tokens = 32
+    topk = 8
+    hidden_size = 128
+    chunk_size = 16
+    num_routed_rows = num_tokens * topk
+
+    expert_outputs = jnp.asarray(
+        rng.standard_normal((num_routed_rows, hidden_size)),
+        dtype=jnp.float32,
+    )
+    inverse_permutation = jnp.asarray(
+        rng.permutation(num_routed_rows),
+        dtype=jnp.int32,
+    )
+    routing_weights = jnp.asarray(
+        rng.random((num_tokens, topk)),
+        dtype=jnp.float32,
+    )
+
+    expected = dense_gather_reduce(
+        expert_outputs,
+        inverse_permutation,
+        routing_weights,
+        topk,
+    )
+
+    chunks = []
+    for start_token in range(0, num_tokens, chunk_size):
+        end_token = start_token + chunk_size
+        start_row = start_token * topk
+        end_row = end_token * topk
+        chunks.append(
+            dense_gather_reduce(
+                expert_outputs,
+                inverse_permutation[start_row:end_row],
+                routing_weights[start_token:end_token],
+                topk,
+            ))
+
+    actual = jnp.concatenate(chunks, axis=0)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
