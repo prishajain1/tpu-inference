@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
 import jax.experimental.pallas as pl
@@ -278,6 +278,19 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    # A decode query only attends to ``sliding_window`` KV tokens.  Letting the
+    # VMEM-based tuner choose a larger KV tile makes the scheduler fetch the
+    # whole overlapping tile even though most of it is masked out.  Keep the
+    # tile MXU-aligned, but do not make it larger than the useful decode window.
+    # Prefill is deliberately left unchanged because its query/KV tiling has
+    # different reuse and causal-mask trade-offs.
+    if model_cfgs.sliding_window is not None:
+        decode_bkv_cap = utils.align_to(model_cfgs.sliding_window,
+                                        mxu_column_size)
+        decode_block_sizes = replace(
+            decode_block_sizes,
+            bkv_sz=min(decode_block_sizes.bkv_sz, decode_bkv_cap),
+        )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     return decode_block_sizes, prefill_block_sizes

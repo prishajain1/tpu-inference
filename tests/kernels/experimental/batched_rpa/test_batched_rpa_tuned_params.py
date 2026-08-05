@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest import mock
 
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ import pytest
 
 from tpu_inference.kernels.experimental.batched_rpa import configs
 from tpu_inference.kernels.experimental.batched_rpa.tuned_params import (
-    TunableParams, TuningKey, get_tuned_params)
+    TunableParams, TuningKey, calculate_block_sizes, get_tuned_params)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -122,6 +123,31 @@ def test_get_tuned_params_populated_mapping_hit():
 
     assert result == _BLOCK_SIZES
     mock_calc.assert_not_called()
+
+
+def test_sliding_window_caps_decode_bkv_size_only():
+    model_config = configs.ModelConfigs(
+        num_q_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+        mask_value=-1e9,
+        sliding_window=1024,
+    )
+    tpu_info = SimpleNamespace(
+        num_lanes=128,
+        mxu_column_size=128,
+    )
+
+    with mock.patch(
+            "tpu_inference.kernels.experimental.batched_rpa.tuned_params"
+            ".pltpu.get_tpu_info",
+            return_value=tpu_info):
+        decode, prefill = calculate_block_sizes(model_config,
+                                                _SERVE_CONFIG,
+                                                vmem_limit_bytes=1 << 30)
+
+    assert decode.bkv_sz == 1024
+    assert prefill.bkv_sz > 1024
 
 
 # ---------------------------------------------------------------------------
