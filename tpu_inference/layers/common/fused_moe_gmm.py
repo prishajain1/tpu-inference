@@ -22,6 +22,8 @@ from jax.sharding import PartitionSpec as P
 
 import tpu_inference.envs as envs
 from tpu_inference.kernels.collectives.hierrs_sc import wrapper as hier_rs_sc
+from tpu_inference.kernels.fused_moe.tp_v1.kernel import \
+    fused_tp_moe_from_routes
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 from tpu_inference.kernels.sparse_core.dense_gather_reduce import \
     dense_gather_reduce
@@ -704,6 +706,41 @@ def fused_moe_func(
 
     if all_gather_fp8:
         hidden_states = _apply_all_gather_fp8(hidden_states, mesh, dtype)
+
+    if envs.USE_FUSED_TP_MOE_KERNEL:
+        tp_size = get_mesh_shape_product(mesh,
+                                         ShardingAxisName.MLP_TENSOR)
+        unsupported = []
+        if use_ep:
+            unsupported.append("expert parallelism")
+        if tp_size != 8:
+            unsupported.append(f"TP size {tp_size}")
+        if (global_num_experts, hidden_size, w2.shape[1], topk) != (128, 2816,
+                                                                   704, 8):
+            unsupported.append(
+                "non-Gemma-4-26B MoE dimensions "
+                f"{(global_num_experts, hidden_size, w2.shape[1], topk)}")
+        if any(value is not None
+               for value in (w1_scale, w2_scale, w1_bias, w2_bias)):
+            unsupported.append("quantized or biased expert weights")
+        if activation not in ("silu", "gelu"):
+            unsupported.append(f"activation {activation!r}")
+        if scatter_results or defer_all_reduce or actual_enable_rs_kernel:
+            unsupported.append("scatter/reduce-scatter/deferred reduction")
+        if unsupported:
+            raise ValueError("USE_FUSED_TP_MOE_KERNEL does not support: " +
+                             ", ".join(unsupported))
+        return fused_tp_moe_from_routes(
+            mesh,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_indices,
+            topk,
+            activation=activation,
+            tp_axis_name=ShardingAxisName.MLP_TENSOR,
+        )
 
     x, group_sizes, topk_argsort_revert_indices = jax.shard_map(
         _process_tokens_locally,

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     AGGREGATED_STATS_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
+    USE_FUSED_TP_MOE_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
     USE_DENSE_MOE: bool = False
     NUM_SLICES: int = 1
@@ -269,6 +270,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use custom expert-parallel kernel for MoE (Mixture of Experts)
     "USE_MOE_EP_KERNEL":
     env_bool("USE_MOE_EP_KERNEL", default=False),
+    # Experimental persistent fused MoE kernel for TP=8 Gemma 4.
+    "USE_FUSED_TP_MOE_KERNEL":
+    env_bool("USE_FUSED_TP_MOE_KERNEL", default=False),
     # Enable megablocks for JAX sparse matmul for MoE (Mixture of Experts)
     # using Unfused weights
     "USE_UNFUSED_MEGABLOCKS":
