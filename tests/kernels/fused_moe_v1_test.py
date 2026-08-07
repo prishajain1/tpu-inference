@@ -20,6 +20,8 @@ from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
 from tpu_inference.kernels.fused_moe.v1.kernel import fused_ep_moe, ref_moe
+from tpu_inference.kernels.fused_moe.v1.tp_kernel import tp_moe_reference
+from tpu_inference.kernels.fused_moe.tp_v1.kernel import fused_tp_moe
 
 jax.config.parse_flags_with_absl()
 
@@ -31,6 +33,19 @@ def cdiv(a, b):
 
 def align_to(x, a):
     return cdiv(x, a) * a
+
+
+def merge_interleaved_tp_w1(w1, tp_size):
+    """Builds the lane-interleaved merged W1 layout used by GMM TP."""
+    num_experts, _, hidden_size, intermediate_size = w1.shape
+    local_intermediate = intermediate_size // tp_size
+    assert local_intermediate % 8 == 0
+    gate = w1[:, 0].reshape(num_experts, hidden_size, tp_size,
+                            local_intermediate // 8, 8)
+    up = w1[:, 1].reshape(num_experts, hidden_size, tp_size,
+                          local_intermediate // 8, 8)
+    return jnp.stack((gate, up), axis=-2).reshape(num_experts, hidden_size,
+                                                  2 * intermediate_size)
 
 
 def gen_moe_inputs(
@@ -454,6 +469,156 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1c=256,
             bd2c=256,
         )
+
+
+@jtu.with_config(jax_numpy_dtype_promotion="standard")
+class TpMoEContractTest(jtu.JaxTestCase):
+    """Checks the TP decomposition before it is implemented in Pallas."""
+
+    @parameterized.parameters(2, 4, 8)
+    def test_gemma4_intermediate_shards(self, tp_size):
+        if len(jax.devices()) < tp_size:
+            self.skipTest(f"Test requires {tp_size} devices")
+
+        devices = np.array(jax.devices()[:tp_size]).reshape(1, tp_size)
+        mesh = Mesh(devices, axis_names=("data", "model"))
+        dtype = jnp.bfloat16
+        top_k = 2
+        num_experts = 8
+        hidden_size = 128
+        intermediate_size = 704
+        num_tokens = 4
+        tokens, w1, w2, _, _, gating_output = gen_moe_inputs(
+            dtype,
+            top_k,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            num_tokens,
+        )
+
+        actual = tp_moe_reference(
+            mesh,
+            tokens,
+            w1,
+            w2,
+            gating_output,
+            top_k,
+            tp_axis_name="model",
+            renormalize_topk_logits=True,
+        )
+        expected = ref_moe(
+            tokens,
+            w1,
+            w2,
+            gating_output,
+            top_k,
+            renormalize_topk_logits=True,
+        )
+
+        # Both references accumulate in F32, but TP changes the reduction
+        # order, so use the same tolerance as the existing BF16 kernel tests.
+        self.assertAllClose(actual, expected, atol=2e-1, rtol=2e-1)
+
+    def test_tp_specific_pallas_checkpoint(self):
+        tp_size = 8
+        if len(jax.devices()) < tp_size:
+            self.skipTest(f"Test requires {tp_size} devices")
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Pallas prototype requires TPU devices")
+
+        devices = np.array(jax.devices()[:tp_size]).reshape(1, tp_size)
+        mesh = Mesh(devices, axis_names=("data", "model"))
+        dtype = jnp.bfloat16
+        top_k = 2
+        num_experts = 8
+        hidden_size = 256
+        intermediate_size = 704
+        num_tokens = 4
+        tokens, w1, w2, _, _, gating_output = gen_moe_inputs(
+            dtype,
+            top_k,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            num_tokens,
+        )
+
+        padded_intermediate_size = 128 * tp_size
+        w1_padded = jnp.pad(
+            w1, ((0, 0), (0, 0), (0, 0),
+                 (0, padded_intermediate_size - intermediate_size)))
+        w1_padded = merge_interleaved_tp_w1(w1_padded, tp_size)
+        actual = fused_tp_moe(
+            mesh,
+            tokens,
+            w1_padded,
+            w2,
+            gating_output,
+            top_k,
+        )
+        expected = ref_moe(
+            tokens,
+            w1,
+            w2,
+            gating_output,
+            top_k,
+            renormalize_topk_logits=True,
+        )
+        self.assertAllClose(actual, expected, atol=2e-1, rtol=2e-1)
+
+    def test_tp_specific_pallas_skewed_routes(self):
+        """Exercises multiple route blocks for the same experts."""
+        tp_size = 8
+        if len(jax.devices()) < tp_size:
+            self.skipTest(f"Test requires {tp_size} devices")
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Pallas prototype requires TPU devices")
+
+        devices = np.array(jax.devices()[:tp_size]).reshape(1, tp_size)
+        mesh = Mesh(devices, axis_names=("data", "model"))
+        dtype = jnp.bfloat16
+        top_k = 2
+        num_experts = 8
+        hidden_size = 256
+        intermediate_size = 704
+        num_tokens = 16
+        tokens, w1, w2, _, _, _ = gen_moe_inputs(
+            dtype,
+            top_k,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            num_tokens,
+        )
+        # Every token selects experts 0 and 1. Each expert therefore receives
+        # 16 rows and must be scheduled as two independent eight-row blocks.
+        gating_output = jnp.full((num_tokens, num_experts), -20, dtype)
+        gating_output = gating_output.at[:, 0].set(20)
+        gating_output = gating_output.at[:, 1].set(19)
+
+        padded_intermediate_size = 128 * tp_size
+        w1_merged = jnp.pad(
+            w1, ((0, 0), (0, 0), (0, 0),
+                 (0, padded_intermediate_size - intermediate_size)))
+        w1_merged = merge_interleaved_tp_w1(w1_merged, tp_size)
+        actual = fused_tp_moe(
+            mesh,
+            tokens,
+            w1_merged,
+            w2,
+            gating_output,
+            top_k,
+        )
+        expected = ref_moe(
+            tokens,
+            w1,
+            w2,
+            gating_output,
+            top_k,
+            renormalize_topk_logits=True,
+        )
+        self.assertAllClose(actual, expected, atol=2e-1, rtol=2e-1)
 
 
 if __name__ == "__main__":
