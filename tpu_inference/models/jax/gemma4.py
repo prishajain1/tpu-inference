@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from functools import partial
 from itertools import islice
 from typing import Any, Iterable, List, Optional, Tuple
@@ -19,13 +20,15 @@ from typing import Any, Iterable, List, Optional, Tuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import Gemma4TextConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import WeightsMapper
 
 from tpu_inference import utils
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
+from tpu_inference.kernels.fused_dense_mlp import fused_dense_mlp_local
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
@@ -93,8 +96,59 @@ class Gemma4MLP(JaxModule):
             prefix=prefix + ".down_proj",
         )
         self.act_fn = partial(nnx.gelu, approximate=True)
+        self.use_fused_dense_mlp = (os.environ.get(
+            "USE_FUSED_DENSE_MLP_KERNEL", "0") == "1")
+
+    def _fused_dense_mlp(self, x: jax.Array) -> jax.Array | None:
+        if not self.use_fused_dense_mlp:
+            return None
+
+        gate_up_weight = self.gate_up_proj.weight.value
+        down_weight = self.down_proj.weight.value
+        gate_up_sharding = jax.typeof(gate_up_weight).sharding
+        down_sharding = jax.typeof(down_weight).sharding
+        x_sharding = jax.typeof(x).sharding
+        if (x.ndim != 2 or x.dtype != jnp.bfloat16 or
+                gate_up_weight.dtype != x.dtype or
+                down_weight.dtype != x.dtype or
+                not isinstance(gate_up_sharding, NamedSharding) or
+                not isinstance(down_sharding, NamedSharding) or
+                not isinstance(x_sharding, NamedSharding)):
+            return None
+
+        mesh = gate_up_sharding.mesh
+        if "model" not in mesh.axis_names:
+            return None
+        x_spec = P(ShardingAxisName.ATTN_DATA, None)
+        gate_up_spec = P(None, "model")
+        down_spec = P("model", None)
+
+        token_tile = min(x.shape[0], 128)
+        if x.shape[0] % token_tile or token_tile % 8:
+            return None
+
+        def fused_local(x_local, gate_up_local, down_local):
+            partial_output = fused_dense_mlp_local(
+                x_local,
+                gate_up_local,
+                down_local,
+                token_tile=token_tile,
+                intermediate_tile=down_local.shape[0],
+            )
+            return jax.lax.psum(partial_output, "model")
+
+        return jax.shard_map(
+            fused_local,
+            mesh=mesh,
+            in_specs=(x_spec, gate_up_spec, down_spec),
+            out_specs=x_spec,
+            check_vma=False,
+        )(x, gate_up_weight, down_weight)
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        fused_result = self._fused_dense_mlp(x)
+        if fused_result is not None:
+            return fused_result
         gate_up = self.gate_up_proj(x)
         gate, up = jnp.split(gate_up, 2, axis=-1)
         gate = self.act_fn(gate)
