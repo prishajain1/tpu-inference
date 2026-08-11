@@ -32,7 +32,7 @@ def is_compatible(
     op: jax.Array,
     idx: jax.Array,
     reduce_group_size: int,
-    row_chunk_size: int = 512,
+    row_chunk_size: int | None = None,
     single_sc: bool = False,
 ) -> bool:
     """Checks if the inputs are compatible with the SparseCore Pallas kernel."""
@@ -56,11 +56,21 @@ def is_compatible(
 
     num_cores = 1 if single_sc else sc_info.num_cores
     num_subcores = sc_info.num_subcores
-    row_wave_size = row_chunk_size * num_cores * num_subcores
-    if idx.size % row_wave_size != 0:
-        return False
 
-    return True
+    if row_chunk_size is not None:
+        if row_chunk_size % sc_info.num_lanes != 0:
+            return False
+        row_wave_size = row_chunk_size * num_cores * num_subcores
+        return idx.size % row_wave_size == 0
+
+    # Auto-detect valid row_chunk_size from candidate chunk sizes for small batches
+    for chunk in (32, 64, 128, 256, 512):
+        if chunk % sc_info.num_lanes == 0:
+            wave_size = chunk * num_cores * num_subcores
+            if idx.size % wave_size == 0:
+                return True
+
+    return False
 
 
 def _sc_gather_reduce(
@@ -313,6 +323,16 @@ def dense_gather_reduce(
                 break
             col_chunk_size -= 128
         if col_chunk_size > 0:
+            sc_info = pltpu.get_tpu_info().sparse_core
+            num_cores = sc_info.num_cores
+            num_subcores = sc_info.num_subcores
+            selected_row_chunk_size = 512
+            for chunk in (32, 64, 128, 256, 512):
+                if chunk % sc_info.num_lanes == 0:
+                    if indices.size % (chunk * num_cores * num_subcores) == 0:
+                        selected_row_chunk_size = chunk
+                        break
+
             # Pallas kernel expects 1D weights
             return _sc_gather_reduce(
                 x,
@@ -320,6 +340,7 @@ def dense_gather_reduce(
                 topk_weights.reshape(-1),
                 reduce_group_size=reduce_group_size,
                 col_chunk_size=col_chunk_size,
+                row_chunk_size=selected_row_chunk_size,
                 topk_wgt_zero_nan=topk_wgt_zero_nan,
             )
     # Fallback to JAX baseline

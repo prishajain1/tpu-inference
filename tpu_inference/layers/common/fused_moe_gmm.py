@@ -304,10 +304,11 @@ def moe_gmm_local(x: jax.Array,
                                                     cur_weights.reshape(-1),
                                                     cur_mask.reshape(-1), topk)
         else:
-            chunk_hidden = dense_gather_reduce(
+            chunk_hidden = ragged_gather_reduce(
                 gmm2_res,
                 cur_indices,
-                cur_weights,
+                cur_weights.reshape(-1),
+                cur_mask.reshape(-1),
                 topk,
             )
         if enable_rs_kernel:

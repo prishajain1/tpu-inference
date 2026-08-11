@@ -614,7 +614,7 @@ def ragged_gather_reduce(
     # also keeps the kernel off configs with num_row_partitions > num_simd_lanes.
     dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
     if (jnp.size(x) * dtype_bytes * 2
-            < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6):
+            < pltpu.get_tpu_info().vmem_capacity_bytes * 0.05):
         return _fallback_implementation(x, indices, topk_weights,
                                         valid_rows_mask, reduce_group_size)
 
