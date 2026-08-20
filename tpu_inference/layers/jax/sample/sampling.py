@@ -168,8 +168,9 @@ def sample(
         # Unshard the logits explicity to avoid latency increase.
         # TODO(gxd3): revisit if the 2nd dimension of the logits can be sharded
         # instead of being replicated.
-        logits = jax.lax.with_sharding_constraint(
-            logits, NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA, None)))
+        # logits = jax.lax.with_sharding_constraint(
+        #     logits, NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA, None)))
+        pass
 
     greedy_tokens = jnp.argmax(logits, axis=-1)
     logits = logits.astype(jnp.float32)
