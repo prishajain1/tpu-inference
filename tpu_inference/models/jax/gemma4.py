@@ -338,7 +338,7 @@ class Gemma4Attention(JaxModule):
         # Gemma4: use different num_kv_heads and head_dim in GLOBAL/LOCAL layers
         if not self.is_sliding:
             # GLOBAL layers
-            self.head_dim_original = config.global_head_dim
+            self.head_dim_original = getattr(config, "global_head_dim", config.head_dim)
         else:
             # LOCAL layers
             self.head_dim_original = config.head_dim
@@ -347,7 +347,7 @@ class Gemma4Attention(JaxModule):
         use_k_eq_v = ((not self.is_sliding)
                       and getattr(config, "attention_k_eq_v", False))
         if use_k_eq_v:
-            self.num_kv_heads = config.num_global_key_value_heads or config.num_key_value_heads
+            self.num_kv_heads = getattr(config, "num_global_key_value_heads", None) or config.num_key_value_heads
         else:
             self.num_kv_heads = config.num_key_value_heads
 
