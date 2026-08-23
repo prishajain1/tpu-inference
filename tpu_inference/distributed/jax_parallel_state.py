@@ -18,7 +18,7 @@ import jax
 from jax.experimental import transfer
 
 BASE_JAX_PORT = 5000
-_PP: Optional[GroupCoordinator] = None
+_PP: Optional["GroupCoordinator"] = None
 
 
 class GroupCoordinator:
