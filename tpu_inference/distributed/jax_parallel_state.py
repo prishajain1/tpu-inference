@@ -18,6 +18,7 @@ import jax
 from jax.experimental import transfer
 
 BASE_JAX_PORT = 5000
+_PP: Optional[GroupCoordinator] = None
 
 
 class GroupCoordinator:
@@ -77,6 +78,7 @@ def connect(prev_ip: str, prev_rank: int):
 
 
 def get_pp_group() -> GroupCoordinator:
-    assert _PP is not None, (
-        "pipeline model parallel group is not initialized")
+    global _PP
+    if _PP is None:
+        _PP = GroupCoordinator(0, 1)
     return _PP
