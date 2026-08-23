@@ -8,7 +8,6 @@ import jax
 import jax.numpy as jnp
 import numpy
 import torch
-import vllm.envs as vllm_envs
 
 # Monkeypatch torch.accelerator.empty_cache to ignore device_allocator error on TPU.
 if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
@@ -155,6 +154,7 @@ class TpuPlatform(Platform):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         try:
+            import vllm.envs as vllm_envs
             if vllm_envs.VLLM_TPU_USING_PATHWAYS:
                 # Causes mutliprocess accessing IFRT when calling jax.devices()
                 return "TPU v6 lite"
@@ -234,10 +234,13 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _resolve_multiprocess_dp(cls, vllm_config: VllmConfig) -> None:
-        """vLLM-native multi-process DP only works for online `vllm serve` (which
-        sets _api_process_rank to -1) with DP > 1, and not with attention DP or
-        on Pathways.
+        """Auto-configure TPU_MULTIPROCESS_DP if not explicitly set.
+
+        TPU MP DP is preferred for multi-process data parallelism because it
+        bypasses JAX multihost coordinator overhead. However, it is
+        incompatible with attention DP (enable_dp_attention) and Pathways.
         """
+        import vllm.envs as vllm_envs
         pc = vllm_config.parallel_config
         if pc.data_parallel_size <= 1:
             return
@@ -265,7 +268,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-
+        import vllm.envs as vllm_envs
         cls._resolve_multiprocess_dp(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
