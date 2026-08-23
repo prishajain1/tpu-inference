@@ -300,7 +300,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase, FusedMoEMethodBase):
         return True
 
     def apply_jax(self, layer: JaxRoutedExperts, x: jax.Array, *,
-                  router_logits: jax.Array) -> jax.Array:
+                  router_logits: jax.Array, defer_all_reduce: bool = False) -> jax.Array:
         """Forward pass for MoE layer.
         Args:
             layer: The MoE layer to apply.
@@ -351,9 +351,12 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase, FusedMoEMethodBase):
 
         else:
             raise ValueError(f"Unsupported moe backend {layer.moe_backend}")
+        kwargs = dict(self.extra_backend_kwargs)
+        if defer_all_reduce:
+            kwargs["defer_all_reduce"] = True
         return moe_apply(layer, x_TD, router_logits, weights,
                          layer.moe_backend, layer.mesh,
-                         self.extra_backend_kwargs)
+                         kwargs)
 
 
 class UnquantizedConfig(QuantizationConfig):

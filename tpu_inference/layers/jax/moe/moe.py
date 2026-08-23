@@ -177,7 +177,8 @@ class JaxMoE(JaxModule):
     def __call__(
         self,
         x_TD: jax.Array,
-        router_logits: Optional[jax.Array] = None
+        router_logits: Optional[jax.Array] = None,
+        defer_all_reduce: bool = False
     ) -> tuple[jax.Array, Optional[jax.Array]]:
         """Performs the forward pass of the MoE layer.
 
@@ -195,7 +196,8 @@ class JaxMoE(JaxModule):
             router_logits = self.router(x_TD)
         x_TD = self.quant_method.apply_jax(self,
                                            x_TD,
-                                           router_logits=router_logits)
+                                           router_logits=router_logits,
+                                           defer_all_reduce=defer_all_reduce)
         if self.enable_return_routed_experts:
             if self.moe_backend in MoEBackend.fused_moe_backends():
                 _, selected_experts_TX = jax.lax.top_k(
@@ -485,7 +487,8 @@ class JaxRoutedExperts(JaxModule):
         assert self.quant_method is not None
         x_TD = self.quant_method.apply_jax(self,
                                            x_TD,
-                                           router_logits=router_logits)
+                                           router_logits=router_logits,
+                                           defer_all_reduce=defer_all_reduce)
         if self.enable_return_routed_experts:
             _, selected_experts_TX = jax.lax.top_k(router_logits, self.top_k)
             return x_TD, selected_experts_TX
