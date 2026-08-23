@@ -332,24 +332,31 @@ class Gemma4Attention(JaxModule):
             self.rope_proportion = 0.25 if not self.is_sliding else 1.0
 
         # Gemma4: use different num_kv_heads and head_dim in GLOBAL/LOCAL layers
-        if not self.is_sliding:
+        if hasattr(config, "per_layer_config") and layer_idx in config.per_layer_config:
+            plc = config.per_layer_config[layer_idx]
+            self.head_dim_original = plc.head_dim
+            self.num_kv_heads = plc.num_key_value_heads
+            self.num_heads = plc.num_attention_heads
+            use_k_eq_v = ((not self.is_sliding)
+                          and getattr(config, "attention_k_eq_v", False))
+        elif not self.is_sliding:
             # GLOBAL layers
             self.head_dim_original = getattr(
                 config, "global_head_dim", None) or getattr(
                     config, "head_dim_global", None) or 512
+            use_k_eq_v = ((not self.is_sliding)
+                          and getattr(config, "attention_k_eq_v", False))
+            if use_k_eq_v:
+                self.num_kv_heads = getattr(
+                    config, "num_global_key_value_heads", None) or getattr(
+                        config, "num_key_value_heads_global", None) or 2
+            else:
+                self.num_kv_heads = getattr(config, "num_key_value_heads", 2)
         else:
             # LOCAL layers
             self.head_dim_original = getattr(config, "head_dim", 256)
-
-        # Determine if this full-attention layer uses k_eq_v
-        use_k_eq_v = ((not self.is_sliding)
-                      and getattr(config, "attention_k_eq_v", False))
-        if use_k_eq_v:
-            self.num_kv_heads = getattr(
-                config, "num_global_key_value_heads", None) or getattr(
-                    config, "num_key_value_heads_global", None) or 2
-        else:
-            self.num_kv_heads = config.num_key_value_heads
+            self.num_kv_heads = getattr(config, "num_key_value_heads", 8)
+            use_k_eq_v = False
 
         self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
 
