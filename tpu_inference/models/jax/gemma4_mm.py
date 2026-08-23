@@ -45,6 +45,7 @@ from tpu_inference.models.jax.utils.multi_modal_utils import \
 from tpu_inference.models.jax.utils.weight_utils import (
     JaxAutoWeightsLoader, LoadableWithIterator, StandardWeightLoader,
     load_nnx_param_from_reshaped_torch)
+from tpu_inference import utils
 from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
@@ -634,7 +635,7 @@ class Gemma4MmModel(JaxModule):
 
         self.vision_tower = Gemma4VisionModel(
             config=vision_config,
-            dtype=model_config.dtype,
+            dtype=utils.to_jax_dtype(model_config.dtype),
             rng=rng,
             quant_config=vllm_config.quant_config,
             mesh=mesh,
@@ -644,7 +645,7 @@ class Gemma4MmModel(JaxModule):
         self.embed_vision = Gemma4MultimodalEmbedder(
             vision_hidden_size=vision_config.hidden_size,
             text_hidden_size=model_config.hf_config.text_config.hidden_size,
-            dtype=model_config.dtype,
+            dtype=utils.to_jax_dtype(model_config.dtype),
             rng=rng,
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.embed_vision",
@@ -693,7 +694,7 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
                 self.lm_head = JaxLmHead(
                     hidden_size=hidden_size,
                     vocab_size=vocab_size,
-                    param_dtype=model_config.dtype,
+                    param_dtype=utils.to_jax_dtype(model_config.dtype),
                     kernel_init=nnx.with_partitioning(init_fn,
                                                       ("model", None)),
                     rngs=rng,
