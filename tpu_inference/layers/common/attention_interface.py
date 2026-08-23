@@ -448,6 +448,8 @@ def sharded_ragged_paged_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            p_block_sizes=(128, 128, 128, 128),
+            m_block_sizes=(128, 128, 128, 128),
         )
         # update_kv_cache is supported by both the v3 default and batched
         # RPA kernels; only the hd64 path doesn't accept it. Default True
