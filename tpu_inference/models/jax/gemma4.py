@@ -332,7 +332,7 @@ class Gemma4Attention(JaxModule):
             self.rope_proportion = 0.25 if not self.is_sliding else 1.0
 
         # Gemma4: use different num_kv_heads and head_dim in GLOBAL/LOCAL layers
-        if hasattr(config, "per_layer_config") and layer_idx in config.per_layer_config:
+        if hasattr(config, "per_layer_config") and layer_idx < len(config.per_layer_config):
             plc = config.per_layer_config[layer_idx]
             self.head_dim_original = plc.head_dim
             self.num_kv_heads = plc.num_key_value_heads
