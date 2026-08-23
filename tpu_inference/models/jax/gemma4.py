@@ -820,7 +820,7 @@ class Gemma4Model(JaxModule):
         hf_config = model_config.hf_config
         text_config = hf_config.text_config
         vocab_size = model_config.get_vocab_size()
-        dtype = model_config.dtype
+        dtype = utils.to_jax_dtype(model_config.dtype)
         rms_norm_eps = text_config.rms_norm_eps
         hidden_size = text_config.hidden_size
 
@@ -1111,7 +1111,7 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
                 self.lm_head = JaxLmHead(
                     hidden_size=hidden_size,
                     vocab_size=vocab_size,
-                    dtype=model_config.dtype,
+                    dtype=utils.to_jax_dtype(model_config.dtype),
                     rngs=rng,
                     prefix="lm_head",
                 )
