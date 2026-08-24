@@ -64,6 +64,7 @@ def test_boolean_env_vars(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("USE_MOE_EP_KERNEL", "0")
     monkeypatch.setenv("LAYOUT_Q_PROJ_AS_NDH", "0")
     monkeypatch.setenv("USE_BATCHED_RPA_KERNEL", "0")
+    monkeypatch.setenv("USE_DISTRIBUTED_TOPK_SAMPLING", "0")
     monkeypatch.setenv("DISABLE_WEIGHT_REQUANTIZATION", "0")
 
     # Test SKIP_JAX_PRECOMPILE (default False)
@@ -111,6 +112,11 @@ def test_boolean_env_vars(monkeypatch: pytest.MonkeyPatch):
     assert envs.USE_BATCHED_RPA_KERNEL is False
     monkeypatch.setenv("USE_BATCHED_RPA_KERNEL", "1")
     assert envs.USE_BATCHED_RPA_KERNEL is True
+
+    assert envs.USE_DISTRIBUTED_TOPK_SAMPLING is False
+    monkeypatch.setenv("USE_DISTRIBUTED_TOPK_SAMPLING", "1")
+    assert envs.USE_DISTRIBUTED_TOPK_SAMPLING is True
+    monkeypatch.setenv("USE_DISTRIBUTED_TOPK_SAMPLING", "0")
 
 
 def test_boolean_env_vars_string_values(monkeypatch: pytest.MonkeyPatch):

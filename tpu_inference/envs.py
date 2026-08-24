@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     TPU_MESH_SORT_BY_COORDS: bool = False
     SAMPLING_MICROBATCH_SIZE: int = 16
+    USE_DISTRIBUTED_TOPK_SAMPLING: bool = False
 
 
 
@@ -461,6 +462,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Microbatch size for sampling block. Set to 0 to disable microbatching.
     "SAMPLING_MICROBATCH_SIZE":
     lambda: int(os.getenv("SAMPLING_MICROBATCH_SIZE", "16")),
+    # Sample supported top-k requests from compact sharded candidates. The
+    # sampler falls back to its general path for unsupported or incomplete
+    # candidate sets.
+    "USE_DISTRIBUTED_TOPK_SAMPLING":
+    env_bool("USE_DISTRIBUTED_TOPK_SAMPLING", default=False),
 }
 
 
