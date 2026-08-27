@@ -28,11 +28,55 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 
+def find_valid_row_chunk_size(
+    idx_size: int,
+    sc_info,
+    single_sc: bool = False,
+    preferred_row_chunk_size: int = 512,
+) -> int:
+    """Finds a tiled row chunk that evenly divides ``idx_size``.
+
+    SparseCore stages the bf16 weights through a 256-element tiled VMEM
+    reference.  Smaller chunks can satisfy the arithmetic row-wave check but
+    fail Mosaic verification when the pipeline slices that reference.
+    """
+    num_cores = 1 if single_sc else sc_info.num_cores
+    num_subcores = sc_info.num_subcores
+    total_subcores = num_cores * num_subcores
+    num_lanes = sc_info.num_lanes
+    for chunk_size in dict.fromkeys([preferred_row_chunk_size, 512, 256]):
+        if chunk_size < 256 or chunk_size % num_lanes != 0:
+            continue
+        row_wave_size = chunk_size * total_subcores
+        if idx_size % row_wave_size == 0:
+            return chunk_size
+    return 0
+
+
+def _select_sc_output_dtype(op_dtype, reduce_group_size: int, sc_info):
+    """Selects a legal SparseCore output dtype for the reduction topology.
+
+    SparseCore HBM blocks are addressed in 32-bit units.  On v6e, a top-k-8
+    reduction over its eight SIMD lanes produces one output row per step.  A
+    bf16 output block would need half of a packed 32-bit row and therefore has
+    an invalid zero-row BlockSpec.  Keep the bf16 input gather, but emit the
+    fp32 accumulator and cast the much smaller reduced result back to bf16 in
+    the wrapper.
+    """
+    out_rows_per_step = sc_info.num_lanes // reduce_group_size
+    output_packing = 32 // jax.dtypes.itemsize_bits(op_dtype)
+    if out_rows_per_step // output_packing >= 1:
+        return op_dtype
+    if out_rows_per_step >= 1:
+        return jnp.float32
+    return None
+
+
 def is_compatible(
     op: jax.Array,
     idx: jax.Array,
     reduce_group_size: int,
-    row_chunk_size: int = 512,
+    row_chunk_size: int | None = None,
     single_sc: bool = False,
 ) -> bool:
     """Checks if the inputs are compatible with the SparseCore Pallas kernel."""
@@ -48,17 +92,28 @@ def is_compatible(
     if sc_info.num_lanes % reduce_group_size != 0:
         return False
 
-    # The output block has (num_lanes // reduce_group_size) // packing rows;
-    # fall back to JAX when that is 0 (the kernel can't emit a zero-row block).
-    packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
-    if (sc_info.num_lanes // reduce_group_size) // packing < 1:
+    # A bf16 input need not force a bf16 SparseCore output.  In particular,
+    # v6e top-k-8 emits one row per SIMD step, which cannot be represented as
+    # half of a packed bf16 row.  It can legally emit one fp32 accumulator row
+    # and cast the reduced output in the wrapper.
+    if _select_sc_output_dtype(op.dtype, reduce_group_size, sc_info) is None:
         return False
 
-    num_cores = 1 if single_sc else sc_info.num_cores
-    num_subcores = sc_info.num_subcores
-    row_wave_size = row_chunk_size * num_cores * num_subcores
-    if idx.size % row_wave_size != 0:
-        return False
+    if row_chunk_size is None:
+        chunk = find_valid_row_chunk_size(idx.size, sc_info, single_sc)
+        if chunk == 0 and not single_sc:
+            chunk = find_valid_row_chunk_size(idx.size, sc_info, True)
+        if chunk == 0:
+            return False
+    else:
+        num_cores = 1 if single_sc else sc_info.num_cores
+        num_subcores = sc_info.num_subcores
+        if (row_chunk_size < 256
+                or row_chunk_size % sc_info.num_lanes != 0):
+            return False
+        row_wave_size = row_chunk_size * num_cores * num_subcores
+        if idx.size % row_wave_size != 0:
+            return False
 
     return True
 
@@ -69,6 +124,7 @@ def _sc_gather_reduce(
     topk_weights: jax.Array | None = None,
     *,
     reduce_group_size: int,
+    output_dtype: jnp.dtype | None = None,
     single_sc: bool = False,
     col_chunk_size: int = int(3.5 * 1024),
     row_chunk_size: int = 512,
@@ -95,15 +151,19 @@ def _sc_gather_reduce(
     topk_weights: Optional weights [M // 128, 128] in bf16 to apply to the
       gathered rows before reduction.
     reduce_group_size: The number of gathered rows to sum per output row.
+    output_dtype: Optional HBM output dtype. The accumulation remains fp32.
+      v6e bf16 top-k-8 uses fp32 output because a single bf16 result row cannot
+      form a complete 32-bit packed SparseCore output row.
     single_sc: Whether to use a single SparseCore.
     col_chunk_size: The size of column chunks to process.
-    row_chunk_size: The size of row chunks for internal processing. Must be ``2
-      * reduce_group_size``.
+    row_chunk_size: The size of row chunks for internal processing. Must be a
+      multiple of the SparseCore SIMD lane count.
     topk_wgt_zero_nan: If True, treat zero ``topk_weights`` as indicators of NaN
       during multiplication, resulting in zero output.
 
   Returns:
-    The reduced result as a bf16 matrix [M / reduce_group_size, K].
+    The reduced result with ``output_dtype`` and shape
+    [M / reduce_group_size, K].
   """
 
     sc_info = pltpu.get_tpu_info().sparse_core
@@ -113,13 +173,14 @@ def _sc_gather_reduce(
     [M] = idx.shape
     _, K = op.shape
     M_out = M // reduce_group_size
+    output_dtype = op.dtype if output_dtype is None else output_dtype
 
     if topk_weights is not None:
         topk_weights = topk_weights.flatten()
 
     @jax.jit
     @pl.kernel(
-        out_type=jax.ShapeDtypeStruct((M_out, K), op.dtype),
+        out_type=jax.ShapeDtypeStruct((M_out, K), output_dtype),
         mesh=plsc.VectorSubcoreMesh(
             core_axis_name="core",
             subcore_axis_name="subcore",
@@ -140,7 +201,8 @@ def _sc_gather_reduce(
             )
         num_row_chunks = M // row_wave_size
         num_col_chunks = K // col_chunk_size
-        packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
+        input_packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
+        output_packing = 32 // jax.dtypes.itemsize_bits(output_dtype)
 
         subcore_first_row_chunk = (lax.axis_index(
             ("core", "subcore")) * num_row_chunks)
@@ -173,19 +235,19 @@ def _sc_gather_reduce(
                         lax.div(
                             idx_ref[pl.ds(r * row_subchunk_size,
                                           row_subchunk_size)],
-                            packing,
+                            input_packing,
                         ),
                         c,
                     ),
                 ),
                 out_specs=pl.BlockSpec(
-                    (out_rows_per_step // packing, col_chunk_size),
+                    (out_rows_per_step // output_packing, col_chunk_size),
                     lambda r, c: (row_chunk_idx * num_row_subchunks + r, c),
                 ),
             )
             def data_pipeline(gather_ref, out_ref):
                 gather_ref = gather_ref.bitcast(op.dtype)
-                out_ref = out_ref.bitcast(op.dtype)
+                out_ref = out_ref.bitcast(output_dtype)
 
                 row_slice = pl.ds(
                     pl.program_id(0) * row_subchunk_size, row_subchunk_size)
@@ -203,13 +265,13 @@ def _sc_gather_reduce(
                         for row_in_group in range(reduce_group_size):
                             row = reduce_group * reduce_group_size + row_in_group
                             row_data = gather_ref[
-                                pl.ds(row * packing, packing),
+                                pl.ds(row * input_packing, input_packing),
                                 pl.ds(col_base, unpack_col_chunk),
                             ].astype(jnp.float32)
-                            if packing == 1:
+                            if input_packing == 1:
                                 row_data = row_data[0]
                             else:
-                                assert packing == 2
+                                assert input_packing == 2
                                 row_data = jnp.where(
                                     lax.bitwise_and(subchunk_idxs[row],
                                                     1) == 0,
@@ -235,7 +297,7 @@ def _sc_gather_reduce(
                                     next_level.append(row_datas[i])
                             row_datas = next_level
                         accs.append(row_datas[0])
-                    out = jnp.stack(accs, axis=0).astype(op.dtype)
+                    out = jnp.stack(accs, axis=0).astype(output_dtype)
                     out_ref[:, pl.ds(col_base, unpack_col_chunk)] = out
 
             data_pipeline(in_hbm_ref.bitcast(jnp.int32),
@@ -274,13 +336,15 @@ def _jax_fallback(x,
     return out.astype(x.dtype)
 
 
-@jax.jit(static_argnames=("reduce_group_size", "topk_wgt_zero_nan"))
+@jax.jit(static_argnames=("reduce_group_size", "topk_wgt_zero_nan",
+                          "row_chunk_size"))
 def dense_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     reduce_group_size: int,
     topk_wgt_zero_nan: bool = False,
+    row_chunk_size: int | None = None,
 ) -> jax.Array:
     """Wrapper that redirects to Pallas dense gather reduce kernel if constraints are met.
 
@@ -294,34 +358,45 @@ def dense_gather_reduce(
     reduce_group_size: Group size for reduction (topk).
     topk_wgt_zero_nan: If True, treat zero weights as indicators of NaN during
       multiplication, resulting in zero output.
+    row_chunk_size: Optional row chunk size for SparseCore. If None, dynamically selected.
   """
-    if is_compatible(x, indices, reduce_group_size):
+    if is_compatible(x,
+                     indices,
+                     reduce_group_size,
+                     row_chunk_size=row_chunk_size):
+        sc_info = pltpu.get_tpu_info().sparse_core
+        output_dtype = _select_sc_output_dtype(x.dtype, reduce_group_size,
+                                               sc_info)
+        chosen_single_sc = False
+        if row_chunk_size is None:
+            chosen_row_chunk_size = find_valid_row_chunk_size(
+                indices.size, sc_info)
+            if chosen_row_chunk_size == 0:
+                chosen_single_sc = True
+                chosen_row_chunk_size = find_valid_row_chunk_size(
+                    indices.size, sc_info, single_sc=True)
+        else:
+            chosen_row_chunk_size = row_chunk_size
         K = x.shape[-1]
-        # The kernel slices the operand along the hidden (column) dimension,
-        # which carries a 128-wide lane tile in the HBM layout
-        # (#tpu.tiled<(4, 128)>). A column chunk that is not a multiple of 128
-        # produces a tpu.memref_slice whose size along the tiled dimension is
-        # not tile-aligned, which Mosaic rejects at compile time with
-        # "Slice sizes along tiled dimensions must be aligned to tiles" (e.g.
-        # hidden_size=2880 -> chunk 1440, and 1440 % 128 = 32). Require the
-        # chunk to be a multiple of the 128 lane tile; when 128 does not divide
-        # hidden_size (as for gpt-oss's 2880) no valid chunk exists and we fall
-        # back to the JAX implementation below.
         col_chunk_size = (min(2048, K) // 128) * 128
         while col_chunk_size > 0:
             if K % col_chunk_size == 0:
                 break
             col_chunk_size -= 128
-        if col_chunk_size > 0:
+        if col_chunk_size > 0 and chosen_row_chunk_size > 0:
             # Pallas kernel expects 1D weights
-            return _sc_gather_reduce(
+            out = _sc_gather_reduce(
                 x,
                 indices,
                 topk_weights.reshape(-1),
                 reduce_group_size=reduce_group_size,
+                output_dtype=output_dtype,
+                single_sc=chosen_single_sc,
                 col_chunk_size=col_chunk_size,
+                row_chunk_size=chosen_row_chunk_size,
                 topk_wgt_zero_nan=topk_wgt_zero_nan,
             )
+            return out.astype(x.dtype)
     # Fallback to JAX baseline
     return _jax_fallback(x, indices, topk_weights, reduce_group_size,
                          topk_wgt_zero_nan)

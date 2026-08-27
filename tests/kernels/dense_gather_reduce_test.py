@@ -25,7 +25,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.sparse_core import dense_gather_reduce as dgr_mod
 from tpu_inference.kernels.sparse_core.dense_gather_reduce import (
-    dense_gather_reduce, is_compatible)
+    _select_sc_output_dtype, dense_gather_reduce, find_valid_row_chunk_size,
+    is_compatible)
 
 jax.config.parse_flags_with_absl()
 
@@ -258,9 +259,9 @@ class IsCompatibleTest(parameterized.TestCase):
 
     # (num_lanes, dtype, reduce_group_size, expected_is_compatible)
     @parameterized.named_parameters(
-        # v6e SparseCore (num_lanes=8). bf16 packing=2: 8//8//2 = 0 -> the
-        # Qwen3-30B-A3B crash -> must fall back.
-        ("v6e_bf16_topk8_degenerate", 8, jnp.bfloat16, 8, False),
+        # v6e SparseCore (num_lanes=8). A bf16 output would have the invalid
+        # packed row count 8//8//2 = 0, so emit fp32 and cast the reduced result.
+        ("v6e_bf16_topk8_fp32_output", 8, jnp.bfloat16, 8, True),
         # Same v6e lanes but f32 (packing=1): 8//8//1 = 1 -> kernel is valid,
         # must NOT be blocked just because it is v6e.
         ("v6e_f32_topk8_ok", 8, jnp.float32, 8, True),
@@ -280,6 +281,78 @@ class IsCompatibleTest(parameterized.TestCase):
             self.assertEqual(
                 is_compatible(op, idx, reduce_group_size=reduce_group_size),
                 expected)
+
+    @parameterized.named_parameters(
+        ("v6e_bf16_topk8", 8, jnp.bfloat16, 8, jnp.float32),
+        ("v6e_bf16_topk4", 8, jnp.bfloat16, 4, jnp.bfloat16),
+        ("v7x_bf16_topk8", 16, jnp.bfloat16, 8, jnp.bfloat16),
+        ("v6e_f32_topk8", 8, jnp.float32, 8, jnp.float32),
+    )
+    def test_sc_output_dtype(self, num_lanes, op_dtype, reduce_group_size,
+                             expected_dtype):
+        sc_info = self._fake_tpu_info(num_lanes=num_lanes).sparse_core
+        self.assertEqual(
+            _select_sc_output_dtype(op_dtype, reduce_group_size, sc_info),
+            expected_dtype)
+
+    def test_v6e_decode_uses_tiled_single_core_row_chunk(self):
+        tpu_info = self._fake_tpu_info(num_lanes=8,
+                                       num_cores=64,
+                                       num_subcores=2)
+        op = jnp.zeros((2048, 2816), jnp.bfloat16)
+        idx = jnp.zeros((2048, ), jnp.int32)
+        sc_info = tpu_info.sparse_core
+
+        # Distributing 2,048 rows over every subcore would require an illegal
+        # 16-row bf16 VMEM block. One core admits a tiled 512-row chunk.
+        self.assertEqual(find_valid_row_chunk_size(2048, sc_info), 0)
+        self.assertEqual(
+            find_valid_row_chunk_size(2048, sc_info, single_sc=True), 512)
+        with mock.patch.object(dgr_mod.pltpu,
+                               "get_tpu_info",
+                               return_value=tpu_info):
+            self.assertTrue(is_compatible(op, idx, reduce_group_size=8))
+
+
+@jtu.with_config(jax_numpy_dtype_promotion="standard")
+class DenseGatherReduceV6Test(jtu.JaxTestCase):
+    """Exercises the Gemma 4 TP decode shape on v6e SparseCore."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            tpu_info = pltpu.get_tpu_info()
+        except ValueError:
+            tpu_info = None
+        if (tpu_info is None or tpu_info.generation != 6
+                or tpu_info.sparse_core is None):
+            self.skipTest("requires TPUv6e SparseCore")
+
+    def test_bf16_topk8_fp32_output(self):
+        out_size = 2048
+        hidden_size = 2816
+        reduce_group_size = 8
+        key = jax.random.key(17)
+        x_key, weight_key = jax.random.split(key)
+        x = jax.random.normal(x_key, (out_size, hidden_size),
+                              jnp.float32).astype(jnp.bfloat16)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(
+            weight_key,
+            (out_size // reduce_group_size, reduce_group_size),
+            jnp.float32,
+        ).astype(jnp.bfloat16)
+
+        self.assertTrue(
+            is_compatible(x,
+                          indices,
+                          reduce_group_size=reduce_group_size))
+        actual = dense_gather_reduce(x, indices, topk_weights,
+                                     reduce_group_size)
+        desired = reference_dense_gather_reduce(x, indices, topk_weights,
+                                                reduce_group_size)
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
