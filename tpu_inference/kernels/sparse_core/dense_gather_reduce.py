@@ -19,6 +19,7 @@ based on provided indices, sums them up, and scatters the results.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -36,31 +37,61 @@ def is_compatible(
     single_sc: bool = False,
 ) -> bool:
     """Checks if the inputs are compatible with the SparseCore Pallas kernel."""
+    del row_chunk_size, single_sc
     if op.dtype != jnp.bfloat16 and op.dtype != jnp.float32:
         return False
-    if op.shape[0] % reduce_group_size != 0:
+    if idx.size % reduce_group_size != 0:
         return False
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
         return False
 
-    if sc_info.num_lanes % reduce_group_size != 0:
-        return False
-
-    # The output block has (num_lanes // reduce_group_size) // packing rows;
-    # fall back to JAX when that is 0 (the kernel can't emit a zero-row block).
     packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
-    if (sc_info.num_lanes // reduce_group_size) // packing < 1:
+    max_sc_group = sc_info.num_lanes // packing
+    sub_group = math.gcd(reduce_group_size, max_sc_group)
+    if sub_group < 1:
         return False
 
-    num_cores = 1 if single_sc else sc_info.num_cores
-    num_subcores = sc_info.num_subcores
-    row_wave_size = row_chunk_size * num_cores * num_subcores
-    if idx.size % row_wave_size != 0:
+    if op.shape[-1] % 128 != 0:
         return False
 
     return True
+
+
+def _select_col_chunk_size(k: int, requested: int) -> int:
+    """Selects a 128-aligned column chunk size that evenly divides K."""
+    col_chunk = min(int(requested), k, 2048)
+    col_chunk = max(128, (col_chunk // 128) * 128)
+    while col_chunk > 128 and k % col_chunk != 0:
+        col_chunk -= 128
+    return col_chunk if k % col_chunk == 0 else 128
+
+
+def _select_row_chunk_size(
+    m_total: int,
+    requested: int,
+    num_subcores_total: int,
+    num_lanes: int,
+    sub_group: int,
+) -> int:
+    """Selects a SparseCore row_chunk_size aligned to num_lanes and bounding outer pipeline depth."""
+    min_rc = max(num_lanes, sub_group)
+    # Keep outer idx_pipeline grid <= 64 to avoid XProf/Mosaic trace buffer overflow on large Hard shapes
+    min_rc_for_trace = max(
+        min_rc,
+        ((m_total + (num_subcores_total * 64) - 1) // (num_subcores_total * 64)),
+    )
+    min_rc_for_trace = ((min_rc_for_trace + num_lanes - 1) // num_lanes) * num_lanes
+    rc = max(int(requested), min_rc_for_trace)
+    rc = ((rc + num_lanes - 1) // num_lanes) * num_lanes
+
+    max_rc = max(min_rc, m_total // num_subcores_total)
+    max_rc = max(min_rc, (max_rc // num_lanes) * num_lanes)
+    rc = min(rc, max_rc)
+    while rc > min_rc and (m_total // num_subcores_total) % rc != 0:
+        rc -= num_lanes
+    return max(min_rc, rc)
 
 
 def _sc_gather_reduce(
@@ -76,54 +107,65 @@ def _sc_gather_reduce(
 ) -> jax.Array:
     """Performs a gather-reduce operation on SparseCore.
 
-  This kernel groups rows of the operand ``op`` based on ``idx``, sums them
-  up, and scatters the results. The gather and add operations are performed
-  in fp32, and the results are written back in bf16.
-
-  Equivalent JAX code::
-
-    gathered = op[idx, :]
-    if topk_weights is not None:
-      flat_weights = topk_weights.flatten()
-      gathered = gathered * flat_weights[:, None].astype(jnp.float32)
-    gathered = jnp.reshape(gathered, (-1, reduce_group_size, op.shape[1]))
-    output = jnp.sum(gathered.astype(jnp.float32), axis=1).astype(jnp.bfloat16)
-
-  Args:
-    op: The operand matrix [B, K] in f32 or bf16 to gather from and reduce.
-    idx: The indices [M,] in int32 guiding the gather.
-    topk_weights: Optional weights [M // 128, 128] in bf16 to apply to the
-      gathered rows before reduction.
-    reduce_group_size: The number of gathered rows to sum per output row.
-    single_sc: Whether to use a single SparseCore.
-    col_chunk_size: The size of column chunks to process.
-    row_chunk_size: The size of row chunks for internal processing. Must be ``2
-      * reduce_group_size``.
-    topk_wgt_zero_nan: If True, treat zero ``topk_weights`` as indicators of NaN
-      during multiplication, resulting in zero output.
-
-  Returns:
-    The reduced result as a bf16 matrix [M / reduce_group_size, K].
+  Supports arbitrary ``reduce_group_size`` (including bag sizes larger than
+  ``sc_info.num_lanes`` such as ``J=16, 32, 64``) by reducing ``sub_group =
+  gcd(reduce_group_size, sc_info.num_lanes // packing)`` rows inside SparseCore
+  vector registers and summing any remaining outer factor, while automatically
+  aligning ``col_chunk_size``, ``row_chunk_size``, and wave padding.
   """
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
         raise RuntimeError("SparseCore is not available on this TPU version.")
 
-    [M] = idx.shape
-    _, K = op.shape
-    M_out = M // reduce_group_size
+    idx = idx.reshape(-1)
+    [M_orig] = idx.shape
+    V, K = op.shape
+    if M_orig % reduce_group_size != 0:
+        raise ValueError(
+            f"idx.size={M_orig} must be divisible by reduce_group_size={reduce_group_size}"
+        )
+    M_final_out = M_orig // reduce_group_size
+
+    packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
+    max_sc_group = sc_info.num_lanes // packing
+    sub_group = math.gcd(reduce_group_size, max_sc_group)
+    outer_group = reduce_group_size // sub_group
+
+    num_cores = 1 if single_sc else sc_info.num_cores
+    num_subcores_total = num_cores * sc_info.num_subcores
+
+    col_chunk = _select_col_chunk_size(K, col_chunk_size)
+    row_chunk = _select_row_chunk_size(
+        M_orig, row_chunk_size, num_subcores_total, sc_info.num_lanes, sub_group
+    )
+    row_wave_size = row_chunk * num_subcores_total
 
     if topk_weights is not None:
-        topk_weights = topk_weights.flatten()
+        topk_weights = topk_weights.reshape(-1)
+
+    pad_m = (row_wave_size - (M_orig % row_wave_size)) % row_wave_size
+    if pad_m > 0:
+        idx = jnp.pad(idx, ((0, pad_m),), constant_values=0)
+        if topk_weights is not None:
+            topk_weights = jnp.pad(
+                topk_weights, ((0, pad_m),), constant_values=0
+            )
+
+    # Ensure all indices are in [0, V - 1] to prevent out-of-bounds DMA faults
+    idx = jnp.clip(idx, 0, V - 1)
+
+    M = idx.shape[0]
+    M_sc_out = M // sub_group
+    M_sc_out_unpadded = M_orig // sub_group
 
     @jax.jit
     @pl.kernel(
-        out_type=jax.ShapeDtypeStruct((M_out, K), op.dtype),
+        out_type=jax.ShapeDtypeStruct((M_sc_out, K), op.dtype),
         mesh=plsc.VectorSubcoreMesh(
             core_axis_name="core",
             subcore_axis_name="subcore",
-            num_cores=1 if single_sc else sc_info.num_cores,
+            num_cores=num_cores,
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
@@ -131,55 +173,48 @@ def _sc_gather_reduce(
         ),
     )
     def kernel(in_hbm_ref, idx_hbm_ref, weights_hbm_ref, out_hbm_ref):
-        row_wave_size = row_chunk_size * lax.axis_size(("core", "subcore"))
-        if M % row_wave_size:
-            raise NotImplementedError(
-                f"{M=} must be divisible by {row_chunk_size=} *"
-                f" num_cores={lax.axis_size('core')} *"
-                f" num_vector_subcores={lax.axis_size('subcore')} = {row_wave_size}"
-            )
         num_row_chunks = M // row_wave_size
-        num_col_chunks = K // col_chunk_size
-        packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
+        num_col_chunks = K // col_chunk
 
-        subcore_first_row_chunk = (lax.axis_index(
-            ("core", "subcore")) * num_row_chunks)
+        subcore_first_row_chunk = (
+            lax.axis_index(("core", "subcore")) * num_row_chunks
+        )
 
-        in_spec = pl.BlockSpec((row_chunk_size, ), lambda i:
-                               (subcore_first_row_chunk + i, ))
-        in_specs = (in_spec, ) * (1 + (weights_hbm_ref is not None))
+        in_spec = pl.BlockSpec(
+            (row_chunk,), lambda i: (subcore_first_row_chunk + i,)
+        )
+        in_specs = (in_spec,) * (1 + (weights_hbm_ref is not None))
 
-        @functools.partial(pltpu.emit_pipeline,
-                           grid=(num_row_chunks, ),
-                           in_specs=in_specs)
+        @functools.partial(
+            pltpu.emit_pipeline,
+            grid=(num_row_chunks,),
+            in_specs=in_specs,
+        )
         def idx_pipeline(idx_ref, weights_ref=None):
             row_chunk_idx = subcore_first_row_chunk + pl.program_id(0)
 
             row_subchunk_size = sc_info.num_lanes
-            out_rows_per_step = row_subchunk_size // reduce_group_size
-            assert reduce_group_size * out_rows_per_step == sc_info.num_lanes
-            num_row_subchunks = row_chunk_size // row_subchunk_size
-            if row_chunk_size % row_subchunk_size:
-                raise ValueError(
-                    f"row_chunk_size needs to be a multiple of {row_subchunk_size}, but"
-                    f" got {row_chunk_size}")
+            out_rows_per_step = row_subchunk_size // sub_group
+            assert sub_group * out_rows_per_step == sc_info.num_lanes
+            num_row_subchunks = row_chunk // row_subchunk_size
 
             @functools.partial(
                 pltpu.emit_pipeline,
                 grid=(num_row_subchunks, num_col_chunks),
                 in_specs=pl.BlockSpec(
-                    (pl.Indirect(row_subchunk_size), col_chunk_size),
+                    (pl.Indirect(row_subchunk_size), col_chunk),
                     lambda r, c: (
                         lax.div(
-                            idx_ref[pl.ds(r * row_subchunk_size,
-                                          row_subchunk_size)],
+                            idx_ref[
+                                pl.ds(r * row_subchunk_size, row_subchunk_size)
+                            ],
                             packing,
                         ),
                         c,
                     ),
                 ),
                 out_specs=pl.BlockSpec(
-                    (out_rows_per_step // packing, col_chunk_size),
+                    (out_rows_per_step // packing, col_chunk),
                     lambda r, c: (row_chunk_idx * num_row_subchunks + r, c),
                 ),
             )
@@ -188,20 +223,24 @@ def _sc_gather_reduce(
                 out_ref = out_ref.bitcast(op.dtype)
 
                 row_slice = pl.ds(
-                    pl.program_id(0) * row_subchunk_size, row_subchunk_size)
+                    pl.program_id(0) * row_subchunk_size, row_subchunk_size
+                )
                 subchunk_idxs = idx_ref[row_slice]
-                weights = (None if weights_ref is None else
-                           weights_ref[row_slice].astype(jnp.float32))
+                weights = (
+                    None
+                    if weights_ref is None
+                    else weights_ref[row_slice].astype(jnp.float32)
+                )
 
-                unpack_col_chunk = 32  # 32 seems to works best when tuning.
+                unpack_col_chunk = 32
 
-                @plsc.parallel_loop(0, col_chunk_size, step=unpack_col_chunk)
+                @plsc.parallel_loop(0, col_chunk, step=unpack_col_chunk)
                 def _(col_base):
                     accs = []
                     for reduce_group in range(out_rows_per_step):
                         row_datas = []
-                        for row_in_group in range(reduce_group_size):
-                            row = reduce_group * reduce_group_size + row_in_group
+                        for row_in_group in range(sub_group):
+                            row = reduce_group * sub_group + row_in_group
                             row_data = gather_ref[
                                 pl.ds(row * packing, packing),
                                 pl.ds(col_base, unpack_col_chunk),
@@ -211,8 +250,7 @@ def _sc_gather_reduce(
                             else:
                                 assert packing == 2
                                 row_data = jnp.where(
-                                    lax.bitwise_and(subchunk_idxs[row],
-                                                    1) == 0,
+                                    lax.bitwise_and(subchunk_idxs[row], 1) == 0,
                                     row_data[0],
                                     row_data[1],
                                 )
@@ -221,7 +259,9 @@ def _sc_gather_reduce(
                                 if topk_wgt_zero_nan:
                                     row_data = jnp.where(
                                         weights[row] == 0.0,
-                                        jnp.zeros_like(row_data), row_data)
+                                        jnp.zeros_like(row_data),
+                                        row_data,
+                                    )
                             row_datas.append(row_data)
 
                         # Tree reduction to reduce critical path and stalls
@@ -229,8 +269,9 @@ def _sc_gather_reduce(
                             next_level = []
                             for i in range(0, len(row_datas), 2):
                                 if i + 1 < len(row_datas):
-                                    next_level.append(row_datas[i] +
-                                                      row_datas[i + 1])
+                                    next_level.append(
+                                        row_datas[i] + row_datas[i + 1]
+                                    )
                                 else:
                                     next_level.append(row_datas[i])
                             row_datas = next_level
@@ -238,38 +279,49 @@ def _sc_gather_reduce(
                     out = jnp.stack(accs, axis=0).astype(op.dtype)
                     out_ref[:, pl.ds(col_base, unpack_col_chunk)] = out
 
-            data_pipeline(in_hbm_ref.bitcast(jnp.int32),
-                          out_hbm_ref.bitcast(jnp.int32))
+            data_pipeline(
+                in_hbm_ref.bitcast(jnp.int32), out_hbm_ref.bitcast(jnp.int32)
+            )
 
         idx_pipeline(
             idx_hbm_ref,
-            *([weights_hbm_ref] if weights_hbm_ref is not None else []))
+            *([weights_hbm_ref] if weights_hbm_ref is not None else []),
+        )
 
-    return kernel(op, idx, topk_weights)  # pylint: disable=no-value-for-parameter
+    out_sc = kernel(op, idx, topk_weights)  # pylint: disable=no-value-for-parameter
+    if pad_m > 0:
+        out_sc = out_sc[:M_sc_out_unpadded, :]
+    if outer_group > 1:
+        out_sc = (
+            out_sc.astype(jnp.float32)
+            .reshape(M_final_out, outer_group, K)
+            .sum(axis=1)
+            .astype(op.dtype)
+        )
+    return out_sc
 
 
-def _jax_fallback(x,
-                  indices,
-                  topk_weights,
-                  reduce_group_size,
-                  topk_wgt_zero_nan=False):
+def _jax_fallback(
+    x,
+    indices,
+    topk_weights,
+    reduce_group_size,
+    topk_wgt_zero_nan=False,
+):
     token_hidden_full = x[indices]
-    cur_sorted = token_hidden_full.reshape(
-        (-1, reduce_group_size, x.shape[-1]))
-    # topk_weights is already 2D [tokens, reduce_group_size]
+    cur_sorted = token_hidden_full.reshape((-1, reduce_group_size, x.shape[-1]))
     cur_topk_weights = jnp.expand_dims(topk_weights, axis=-1)
-    # Accumulate in float32 to match reference precision and Pallas kernel
-    # behavior.
     if topk_wgt_zero_nan:
         cur_weighted = jnp.where(
             cur_topk_weights == 0.0,
             0.0,
-            cur_sorted.astype(jnp.float32) *
-            cur_topk_weights.astype(jnp.float32),
+            cur_sorted.astype(jnp.float32)
+            * cur_topk_weights.astype(jnp.float32),
         )
     else:
         cur_weighted = cur_sorted.astype(
-            jnp.float32) * cur_topk_weights.astype(jnp.float32)
+            jnp.float32
+        ) * cur_topk_weights.astype(jnp.float32)
     out = cur_weighted.sum(axis=-2)
     return out.astype(x.dtype)
 
@@ -282,46 +334,19 @@ def dense_gather_reduce(
     reduce_group_size: int,
     topk_wgt_zero_nan: bool = False,
 ) -> jax.Array:
-    """Wrapper that redirects to Pallas dense gather reduce kernel if constraints are met.
-
-  Otherwise, it falls back to the JAX baseline.
-
-  Args:
-    x: Input array [out_size, hidden_size].
-    indices: Gather indices [out_size].
-    topk_weights: 2D weights [tokens, reduce_group_size], where tokens *
-      reduce_group_size = out_size.
-    reduce_group_size: Group size for reduction (topk).
-    topk_wgt_zero_nan: If True, treat zero weights as indicators of NaN during
-      multiplication, resulting in zero output.
-  """
+    """Wrapper that redirects to Pallas dense gather reduce kernel if constraints are met."""
     if is_compatible(x, indices, reduce_group_size):
         K = x.shape[-1]
-        # The kernel slices the operand along the hidden (column) dimension,
-        # which carries a 128-wide lane tile in the HBM layout
-        # (#tpu.tiled<(4, 128)>). A column chunk that is not a multiple of 128
-        # produces a tpu.memref_slice whose size along the tiled dimension is
-        # not tile-aligned, which Mosaic rejects at compile time with
-        # "Slice sizes along tiled dimensions must be aligned to tiles" (e.g.
-        # hidden_size=2880 -> chunk 1440, and 1440 % 128 = 32). Require the
-        # chunk to be a multiple of the 128 lane tile; when 128 does not divide
-        # hidden_size (as for gpt-oss's 2880) no valid chunk exists and we fall
-        # back to the JAX implementation below.
-        col_chunk_size = (min(2048, K) // 128) * 128
-        while col_chunk_size > 0:
-            if K % col_chunk_size == 0:
-                break
-            col_chunk_size -= 128
-        if col_chunk_size > 0:
-            # Pallas kernel expects 1D weights
+        col_chunk_size = _select_col_chunk_size(K, 2048)
+        if K % col_chunk_size == 0:
             return _sc_gather_reduce(
                 x,
-                indices,
+                indices.reshape(-1),
                 topk_weights.reshape(-1),
                 reduce_group_size=reduce_group_size,
                 col_chunk_size=col_chunk_size,
                 topk_wgt_zero_nan=topk_wgt_zero_nan,
             )
-    # Fallback to JAX baseline
-    return _jax_fallback(x, indices, topk_weights, reduce_group_size,
-                         topk_wgt_zero_nan)
+    return _jax_fallback(
+        x, indices, topk_weights, reduce_group_size, topk_wgt_zero_nan
+    )
