@@ -24,6 +24,143 @@ from jax.experimental.pallas import tpu_sc as plsc
 from tpu_inference.kernels.sparse_core import core_map_helper
 
 
+@functools.lru_cache(maxsize=64)
+def _build_vector_indexed_gather_kernel(
+    l_work: int,
+    d_padded: int,
+    b_size: int,
+    num_workers: int,
+    num_subcores: int,
+    dtype: jnp.dtype,
+):
+    """Builds a zero-copy vector indirect DMA SparseCore kernel for 32-bit rows."""
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=num_workers // num_subcores,
+        num_subcores=num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    items_per_subcore = l_work // num_workers
+    num_steps = items_per_subcore // b_size
+
+    def sc_kernel(table_hbm, index_hbm, out_hbm, idx_vmem, rows_vmem):
+        wid = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
+        subcore_start = wid * items_per_subcore
+
+        if num_steps <= 4:
+            for step in range(num_steps):
+                offset = subcore_start + step * b_size
+                pltpu.sync_copy(index_hbm.at[pl.ds(offset, b_size)], idx_vmem)
+                pltpu.sync_copy(table_hbm.at[idx_vmem], rows_vmem)
+                pltpu.sync_copy(rows_vmem, out_hbm.at[pl.ds(offset, b_size), :])
+        else:
+
+            def step_fn(step, _):
+                offset = subcore_start + step * b_size
+                pltpu.sync_copy(index_hbm.at[pl.ds(offset, b_size)], idx_vmem)
+                pltpu.sync_copy(table_hbm.at[idx_vmem], rows_vmem)
+                pltpu.sync_copy(rows_vmem, out_hbm.at[pl.ds(offset, b_size), :])
+                return None
+
+            lax.fori_loop(0, num_steps, step_fn, None)
+
+    return pl.kernel(
+        sc_kernel,
+        out_type=jax.ShapeDtypeStruct((l_work, d_padded), dtype),
+        mesh=mesh,
+        scratch_types=[
+            pltpu.VMEM((b_size,), jnp.int32),
+            pltpu.VMEM((b_size, d_padded), dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            needs_layout_passes=False,
+            disable_bounds_checks=True,
+        ),
+        name="sc_vector_indexed_gather_v2",
+    )
+
+
+def indexed_gather_v2(
+    x: jax.Array,
+    indices: jax.Array,
+    *,
+    block_rows: int | None = None,
+) -> jax.Array:
+    """Full-range SparseCore vector indirect gather with ~128 KiB VMEM tiles."""
+    assert x.ndim == 2, "Indexed gather only supports 2d inputs."
+    assert indices.ndim == 1, "Indexed gather only supports 1d indices."
+
+    orig_l = indices.shape[0]
+    orig_d = x.shape[1]
+    dtype = x.dtype
+    dtype_bits = jax.dtypes.itemsize_bits(dtype)
+
+    sc_info = pltpu.get_tpu_info().sparse_core
+    if sc_info is None or (orig_l <= 4096 and orig_d <= 128):
+        d_num = lax.GatherDimensionNumbers(
+            offset_dims=(1,),
+            collapsed_slice_dims=(0,),
+            start_index_map=(0,),
+        )
+        return lax.gather(
+            x,
+            indices[:, None],
+            dimension_numbers=d_num,
+            slice_sizes=(1, orig_d),
+            mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+        )
+
+    if dtype_bits != 32:
+        return ragged_gather_v2(
+            x,
+            indices,
+            jnp.array([0], jnp.int32),
+            jnp.array([orig_l], jnp.int32),
+            use_vector_dma=False,
+        )
+
+    num_cores = int(sc_info.num_cores)
+    num_subcores = int(sc_info.num_subcores)
+    num_workers = num_cores * num_subcores
+
+    pad_d = (-orig_d) % 128
+    if pad_d > 0:
+        x_in = jnp.pad(x, ((0, 0), (0, pad_d)))
+        d_padded = orig_d + pad_d
+    else:
+        x_in = x
+        d_padded = orig_d
+
+    b_cfg = (
+        block_rows
+        if block_rows is not None
+        else (128 if d_padded >= 256 else 256)
+    )
+    max_b_vmem = (128 * 1024) // (d_padded * 4)
+    b_size = max(8, min(b_cfg, max_b_vmem, max(32, orig_l // num_workers)))
+
+    tile_quantum = num_workers * b_size
+    pad_l = (-orig_l) % tile_quantum
+    if pad_l > 0:
+        index_in = jnp.pad(indices, (0, pad_l), constant_values=0)
+        l_work = orig_l + pad_l
+    else:
+        index_in = indices
+        l_work = orig_l
+
+    items_per_subcore = l_work // num_workers
+    while items_per_subcore % b_size != 0 and b_size > 8:
+        b_size //= 2
+
+    kernel = _build_vector_indexed_gather_kernel(
+        l_work, d_padded, b_size, num_workers, num_subcores, dtype
+    )
+    out = kernel(x_in, index_in)
+    if pad_l > 0 or pad_d > 0:
+        out = out[:orig_l, :orig_d]
+    return out
+
+
 def calculate_col_size(hidden_size: int, packing: int) -> int:
     """Calculates the max column size bounded by VMEM limits and hidden_size divisibility."""
     tpu_info = pltpu.get_tpu_info()
@@ -66,6 +203,7 @@ def main_kernel_v2(
     core_axis_name: str,
     subcore_axis_name: str,
     num_row_subchunks: int,
+    col_size: int | None = None,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -74,7 +212,8 @@ def main_kernel_v2(
     hidden_size = in_hbm_ref.shape[-1]
     dtype_bits = jax.dtypes.itemsize_bits(out_hbm_ref.dtype)
     packing = 32 // dtype_bits
-    col_size = calculate_col_size(hidden_size, packing)
+    if col_size is None:
+        col_size = calculate_col_size(hidden_size, packing)
 
     assert isinstance(hidden_size,
                       int), f"hidden_size must be int, got {type(hidden_size)}"
@@ -109,23 +248,10 @@ def main_kernel_v2(
 
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
-    # SparseCore `.bitcast()` leverages hardware Row-Packing for 16-bit -> 32-bit conversion.
-    # The logical row count halves, while physical column dimensions remain unchanged.
     in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)
     out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)
 
     num_phys_cols = col_size
-
-    # The outer pipeline runs on the Vector Core, hoisting the integer arithmetic required
-    # to decode the row-packed indices. This prevents scalar-core instruction starvation
-    # during the execution of the indirect `in_specs` block lambdas.
-
-    # TODO(guoweij): The nested `emit_pipeline` design creates a pipeline bubble (DMA wait)
-    # when the inner pipeline empties and restarts with new indices. This is a known
-    # high-level API limitation, currently amortized by setting a large num_row_subchunks
-    # and shouldn't be an issue for most use cases. We should still monitor
-    # the bubble's impact on E2E performance and, if needed, manually reimplement
-    # this using primitive operations to eliminate the bubble entirely.
 
     def col_loop(col_base, gather_ref, out_ref, idx_rem, unpack_col_chunk):
         col_slice = pl.ds(col_base, unpack_col_chunk)
@@ -134,8 +260,6 @@ def main_kernel_v2(
             out_dt = out_ref.bitcast(dtype)
             out_dt[:, col_slice] = gather_dt[:, col_slice]
         else:
-            # Manual bitwise extraction and packing for packing >= 2 (bfloat16, int8, int4)
-            # bf16: 0xFFFF, int8: 0xFF, int4: 0xF
             mask = (1 << dtype_bits) - 1
             shift_multiplier = dtype_bits.bit_length() - 1
             for i in range(num_simd_lanes // packing):
@@ -157,7 +281,6 @@ def main_kernel_v2(
             pl.program_id(0) * row_subchunk_size, row_subchunk_size)
         subchunk_idxs = idx_ref[row_slice]
         if packing > 1:
-            # Equivalent to `subchunk_idxs % packing`
             idx_rem = jnp.bitwise_and(subchunk_idxs, packing - 1)
         else:
             idx_rem = jnp.zeros_like(subchunk_idxs)
@@ -215,26 +338,49 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
-@jax.jit
-def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
-                     end: jax.Array) -> jax.Array:
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "num_row_subchunks",
+        "col_size",
+        "block_rows",
+        "use_vector_dma",
+    ),
+)
+def ragged_gather_v2(
+    x: jax.Array,
+    indices: jax.Array,
+    start: jax.Array | None = None,
+    end: jax.Array | None = None,
+    *,
+    num_row_subchunks: int | None = None,
+    col_size: int | None = None,
+    block_rows: int | None = None,
+    use_vector_dma: bool = True,
+) -> jax.Array:
     """Perform gather on indices within dynamic array start and end using BlockSpec."""
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
 
-    if jnp.isscalar(start):
-        start = start[None]
-    if jnp.isscalar(end):
-        end = end[None]
-
     dtype = x.dtype
-    # any data type with a size of {4,8,16,32} should be fine
     dtype_bits = jax.dtypes.itemsize_bits(dtype)
     if dtype_bits not in (4, 8, 16, 32):
         raise ValueError(
             f"dtype bit width must be one of 4, 8, 16, or 32, but got {dtype_bits} ({dtype})"
         )
+
+    if use_vector_dma and dtype_bits == 32 and (start is None or end is None):
+        return indexed_gather_v2(x, indices, block_rows=block_rows)
+
+    if start is None:
+        start = jnp.array([0], jnp.int32)
+    elif jnp.isscalar(start):
+        start = start[None]
+    if end is None:
+        end = jnp.array([indices.size], jnp.int32)
+    elif jnp.isscalar(end):
+        end = end[None]
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
@@ -244,7 +390,11 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
     out_size = indices.size
 
     packing = 32 // dtype_bits
-    col_size = calculate_col_size(hidden_size, packing)
+    max_col_size = calculate_col_size(hidden_size, packing)
+    if col_size is None:
+        col_size = max_col_size
+    else:
+        col_size = max(128, (min(col_size, hidden_size, max_col_size) // 128) * 128)
 
     aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size
 
@@ -253,16 +403,22 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
     base_block_size = num_simd_lanes * num_cores
 
     # Calculate ideal num_row_subchunks to avoid too much padding overhead.
-    num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size))
+    if num_row_subchunks is None:
+        num_row_subchunks = max(
+            1, min(4, (out_size + base_block_size - 1) // base_block_size)
+        )
+    else:
+        num_row_subchunks = max(1, int(num_row_subchunks))
 
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
 
     out_pad_size = (
-        (out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+        (out_size + block_size - 1) // block_size
+    ) * block_size - out_size
+    if out_pad_size > 0:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -276,18 +432,20 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
             num_row_subchunks=num_row_subchunks,
+            col_size=col_size,
         ),
         out_type=jax.ShapeDtypeStruct(
-            (out_size + out_pad_size, aligned_hidden_size), dtype),
+            (out_size + out_pad_size, aligned_hidden_size), dtype
+        ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
         scratch_types=[
-            pltpu.VMEM((16, ), jnp.int32),
-            pltpu.VMEM((16, ), jnp.int32),
-            pltpu.SemaphoreType.DMA((1, )),
+            pltpu.VMEM((16,), jnp.int32),
+            pltpu.VMEM((16,), jnp.int32),
+            pltpu.SemaphoreType.DMA((1,)),
         ],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
