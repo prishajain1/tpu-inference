@@ -304,24 +304,31 @@ def _all_gather_kernel(
                     preferred_element_type=jnp.float32,
                 ).astype(x_vmem_scratch_ref.dtype)
         else:
-            # TODO(chengjiyao): optimize the vstore
             if rhs_transpose:
                 lhs = x_vmem_scratch_ref.at[x_vmem_working_slot, :,
                                             k_slice][...]
                 rhs = y_vmem_scratch_ref.at[n_slice, k_slice][...]
-                acc_vmem_scratch_ref[...] += lax.dot_general(
+                dot_res = lax.dot_general(
                     lhs,
                     rhs,
                     dimension_numbers=(((1, ), (1, )), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
             else:
-                acc_vmem_scratch_ref[...] += jnp.dot(
+                dot_res = jnp.dot(
                     x_vmem_scratch_ref.at[x_vmem_working_slot, :,
                                           k_slice][...],
                     y_vmem_scratch_ref.at[k_slice, n_slice][...],
                     preferred_element_type=jnp.float32,
                 )
+
+            @pl.when(working_bk_i == 0)
+            def _init_acc():
+                acc_vmem_scratch_ref[...] = dot_res
+
+            @pl.when(jnp.logical_and(working_bk_i > 0, working_bk_i < grid_k - 1))
+            def _accum_acc():
+                acc_vmem_scratch_ref[...] += dot_res
 
             @pl.when(working_bk_i == grid_k - 1)
             def _update():
@@ -329,26 +336,9 @@ def _all_gather_kernel(
                     "[AGMM debug] update, o_receiving_slot={}",
                     o_receiving_slot,
                 )
-                o_vmem_scratch_ref.at[o_receiving_slot][
-                    ...] = acc_vmem_scratch_ref[...].astype(
-                        x_vmem_scratch_ref.dtype)
-                # TODO(chengjiyao): based on the kyuyeunk' suggestion:
-                # this logic can be more optimized. right now it does this.
-                # line 316 performs dot
-                # line 316 loads from acc_vmem_scartch_ref
-                # line 316 adds resulting dot with acc_vmem_scratch_ref
-                # line 316 stores result into acc_vmem_scratch_ref
-                # line 335 loads from acc_vmem_scratch_ref again.
-                # line 338 zero initializes & stores it to acc_vmem_scratch_ref
-                # better way would be
-
-                # perform dot
-                # if working_bk_i != 0, load from acc_vmem_scratch_ref and add result
-                # from previous step. If not, skip this process.
-                # if working_bk_i == gk - 1, store the result from step 2 into
-                # o_vmem_scratch_ref, if not, store it into acc_vmem_scratch_ref
-                acc_vmem_scratch_ref[...] = jnp.zeros_like(
-                    acc_vmem_scratch_ref)
+                o_vmem_scratch_ref.at[o_receiving_slot][...] = (
+                    acc_vmem_scratch_ref[...] + dot_res
+                ).astype(x_vmem_scratch_ref.dtype)
 
     def _do_o_local_copy(wait: bool = False):
         working_global_step_id = global_step_id - grid_k - 1
@@ -408,8 +398,6 @@ def _all_gather_kernel(
     @pl.when(global_step_id == 0)
     @jax.named_scope("_start_first_remote_copy")
     def _start_first_remote_copy():
-        if grid_k > 1:
-            acc_vmem_scratch_ref[...] = jnp.zeros_like(acc_vmem_scratch_ref)
         # Barrier with both neighbors at the start, since we will be
         # communicating with both.
         util.local_barrier(left_neighbor, right_neighbor)
@@ -545,11 +533,124 @@ def get_vmem_estimate_bytes(
         2 * m_per_device * k * dtypes.itemsize_bits(x_dtype) // 8
         # x_vmem_scratch_ref
         + y_vmem_bytes  # y_vmem_scratch_ref
-        + 2 * m * bn * dtypes.itemsize_bits(out_dtype) // 8
-        # o_vmem_scratch_ref
+        + 2 * m_per_device * bn * dtypes.itemsize_bits(out_dtype) // 8
+        # o_vmem_scratch_ref: shape is (2, m_per_device, bn)
         + acc_bytes  # acc_vmem_scratch_ref, jnp.float32
     )
     return total_bytes
+
+
+def _matmul_3d_kernel(x_ref, w_ref, o_ref, acc_ref):
+    k_idx = pl.program_id(2)
+
+    @pl.when(k_idx == 0)
+    def _():
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    acc_ref[...] += jnp.dot(
+        x_ref[...], w_ref[...], preferred_element_type=jnp.float32
+    )
+
+    @pl.when(k_idx == pl.num_programs(2) - 1)
+    def _():
+        o_ref[...] = acc_ref[...].astype(o_ref.dtype)
+
+
+def _matmul_3d_add_kernel(x_ref, w_ref, bias_ref, o_ref, acc_ref):
+    k_idx = pl.program_id(2)
+
+    @pl.when(k_idx == 0)
+    def _():
+        acc_ref[...] = bias_ref[...].astype(jnp.float32)
+
+    acc_ref[...] += jnp.dot(
+        x_ref[...], w_ref[...], preferred_element_type=jnp.float32
+    )
+
+    @pl.when(k_idx == pl.num_programs(2) - 1)
+    def _():
+        o_ref[...] = acc_ref[...].astype(o_ref.dtype)
+
+
+def _pallas_tiled_matmul(x, w, bm, bn, bk, bias=None):
+    m, k = x.shape
+    _, n = w.shape
+    bm = min(bm, m)
+    bn = min(bn, n)
+    bk = min(bk, k)
+    grid = (m // bm, n // bn, k // bk)
+    out_specs = pl.BlockSpec((bm, bn), lambda i, j, p: (i, j))
+    scratch_shapes = [pltpu.VMEM((bm, bn), jnp.float32)]
+    compiler_params = pltpu.CompilerParams(
+        dimension_semantics=("parallel", "parallel", "arbitrary"),
+        vmem_limit_bytes=96 * 1024 * 1024,
+    )
+    if bias is None:
+        return pl.pallas_call(
+            _matmul_3d_kernel,
+            out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
+            grid=grid,
+            in_specs=[
+                pl.BlockSpec((bm, bk), lambda i, j, p: (i, p)),
+                pl.BlockSpec((bk, bn), lambda i, j, p: (p, j)),
+            ],
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+            compiler_params=compiler_params,
+        )(x, w)
+    return pl.pallas_call(
+        _matmul_3d_add_kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
+        grid=grid,
+        in_specs=[
+            pl.BlockSpec((bm, bk), lambda i, j, p: (i, p)),
+            pl.BlockSpec((bk, bn), lambda i, j, p: (p, j)),
+            pl.BlockSpec((bm, bn), lambda i, j, p: (i, j)),
+        ],
+        out_specs=out_specs,
+        scratch_shapes=scratch_shapes,
+        compiler_params=compiler_params,
+    )(x, w, bias)
+
+
+def _tiled_all_gather_matmul_shard(x, y, axis_name, tp_size, bm, bn, bk):
+    m_local, k = x.shape
+    _, n_local = y.shape
+    m_global = m_local * tp_size
+    # Large K & N regime (e.g. Hard: M=4096, K=8192, N=32768): 2-chunk M-split lax.scan
+    # overlaps chunk-1 AllGather with chunk-0 2048x2048x2048 Pallas matmul while keeping VMEM <= 48 MiB.
+    if k >= 8192 and n_local >= 4096 and m_local % 2 == 0:
+        chunks = 2
+        chunk_m = m_local // chunks
+        x_chunks = x.reshape(chunks, chunk_m, k)
+        bm_c = min(2048, tp_size * chunk_m)
+        bn_c = min(bn, n_local)
+        bk_c = min(bk, k)
+
+        def _scan_step(carry, x_c):
+            x_c_all = lax.all_gather(x_c, axis_name, axis=0, tiled=True)
+            out_c = _pallas_tiled_matmul(x_c_all, y, bm_c, bn_c, bk_c)
+            return carry, out_c
+
+        _, outs = lax.scan(_scan_step, None, x_chunks)
+        outs = outs.reshape(chunks, tp_size, chunk_m, n_local)
+        outs = jnp.swapaxes(outs, 0, 1)
+        return outs.reshape(m_global, n_local)
+
+    # Medium K=4096, M=4096 regime: 2-way K-split overlaps second-half AllGather with
+    # first-half Pallas matmul and fuses accumulation into _matmul_3d_add_kernel.
+    if m_global >= 4096 and k == 4096 and n_local >= 2048 and (k // 2) % bk == 0:
+        half_k = k // 2
+        x0_full = lax.all_gather(x[:, :half_k], axis_name, axis=0, tiled=True)
+        x1_full = lax.all_gather(x[:, half_k:], axis_name, axis=0, tiled=True)
+        out0 = _pallas_tiled_matmul(x0_full, y[:half_k, :], bm, bn, bk)
+        return _pallas_tiled_matmul(
+            x1_full, y[half_k:, :], bm, bn, bk, bias=out0
+        )
+
+    # Default / Easy regime: native XLA ICI all_gather + 3D-tiled Pallas matmul.
+    x_gathered = lax.all_gather(x, axis_name, axis=0, tiled=True)
+    return _pallas_tiled_matmul(x_gathered, y, bm, bn, bk)
 
 
 def validate_inputs(x, y, tp_size, rhs_transpose=False):
@@ -599,6 +700,7 @@ def all_gather_matmul(
     bn: int | None = None,
     bk: int | None = None,
     rhs_transpose: bool = False,
+    use_tiled_fastpath: bool = True,
 ):
     """Performs all-gather on the input tensor and then a matmul.
 
@@ -631,9 +733,37 @@ def all_gather_matmul(
             m, n, k,
             jnp.dtype(x.dtype).name, tp_size))
     if bn is None:
-        bn = tuned_bn if tuned_bn is not None else n
+        bn = tuned_bn if tuned_bn is not None else n_per_device
     if bk is None:
         bk = tuned_bk if tuned_bk is not None else k
+    bn = min(int(bn), n_per_device)
+    bk = min(int(bk), k)
+
+    if (
+        use_tiled_fastpath
+        and not rhs_transpose
+        and m % 512 == 0
+        and n_per_device % bn == 0
+        and k % bk == 0
+    ):
+        bm = min(m_per_device, m)
+        return jax.jit(
+            jax.shard_map(
+                functools.partial(
+                    _tiled_all_gather_matmul_shard,
+                    axis_name=axis_name,
+                    tp_size=tp_size,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                ),
+                mesh=mesh,
+                in_specs=(P(axis_name, None), y_in_spec),
+                out_specs=P(None, axis_name),
+                check_vma=False,
+            )
+        )(x, y)
+
     grid_n = _cdiv(n_per_device, bn)
     grid_k = _cdiv(k, bk)
     acc_shape = (m_per_device, bn)
